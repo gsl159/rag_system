@@ -6,10 +6,11 @@
 
 | 模块 | 功能 |
 |------|------|
-| **文档处理** | PDF / Word / HTML / TXT / Markdown 解析，质量自动评分，不合格文档拦截 |
-| **混合检索** | Dense（Milvus HNSW）+ Sparse（BM25）→ RRF 融合，召回率更高 |
-| **RAG Pipeline** | Query Rewrite → Retrieve → Rerank → Generate 全链路 |
-| **三层缓存** | Redis：Query缓存 / Embedding缓存 / RAG结果缓存，防雪崩抖动TTL |
+| **文档处理** | PDF / Word / HTML / TXT / Markdown 解析，质量自动评分，MD5去重 |
+| **混合检索** | Dense（Milvus HNSW）+ Sparse（BM25）→ RRF 融合，线程安全 |
+| **RAG Pipeline** | Query Rewrite → Retrieve → Rerank → Generate，C2→C1→C0 硬超时降级 |
+| **三层缓存** | Redis：含 doc_version + embedding_version 的版本化Key，文档更新自动失效 |
+| **SingleFlight** | 热点查询防风暴，同一 Query 只允许 1 个请求进入 RAG 主流程 |
 | **自动评估** | LLM 自动打分：相关性 / 忠实性 / 完整性，写入 PostgreSQL |
 | **用户反馈** | 👍/👎 反馈闭环，差评 Top 分析，满意度统计 |
 | **可视化** | Vue3 + ECharts：查询趋势、缓存命中、文档质量、QPS、评分趋势 |
@@ -27,76 +28,21 @@
 ┌───────────────────▼─────────────────────────────────┐
 │  FastAPI 后端  (port 8000)                          │
 │  ├── /chat     RAG 问答（同步 + SSE 流式）           │
-│  ├── /upload   文档上传与管理                        │
+│  ├── /upload   文档上传与管理（MD5去重）              │
 │  ├── /feedback 用户反馈                              │
 │  └── /metrics  监控指标                              │
 └──────┬─────────┬────────┬────────────┬──────────────┘
        │         │        │            │
   ┌────▼──┐ ┌───▼───┐ ┌──▼────┐ ┌────▼───┐
   │Milvus │ │ Redis │ │  PG   │ │ MinIO  │
-  │向量库 │ │三层缓存│ │元数据 │ │文件存储│
+  │向量库 │ │版本缓存│ │元数据 │ │文件存储│
   └───────┘ └───────┘ └───────┘ └────────┘
 
-RAG Pipeline:
-  Query → Rewrite → Embed(缓存) → Hybrid Search
-        → Rerank → Context Build → LLM Generate → Cache
-```
-
----
-
-## 📁 项目结构
-
-```
-rag-system/
-├── backend/
-│   ├── app/
-│   │   ├── main.py              # FastAPI 入口 + lifespan
-│   │   ├── core/
-│   │   │   ├── config.py        # 全局配置（pydantic-settings）
-│   │   │   ├── logger.py        # loguru 日志
-│   │   │   └── llm.py           # LLM + Embed 客户端
-│   │   ├── db/
-│   │   │   ├── postgres.py      # SQLAlchemy ORM + 连接
-│   │   │   ├── redis.py         # 三层缓存 + 命中率统计
-│   │   │   ├── milvus.py        # 向量库（HNSW索引）
-│   │   │   └── minio.py         # 对象存储
-│   │   ├── rag/
-│   │   │   ├── pipeline.py      # 完整 RAG Pipeline
-│   │   │   ├── retriever.py     # Hybrid Search（Dense+BM25+RRF）
-│   │   │   └── reranker.py      # LLM Reranker + Simple Reranker
-│   │   ├── services/
-│   │   │   ├── doc_service.py   # 解析/清洗/分块/质量控制
-│   │   │   ├── eval_service.py  # LLM 自动评分 + 指标聚合
-│   │   │   └── feedback_service.py  # 反馈存储 + 统计
-│   │   └── api/
-│   │       ├── chat.py          # /chat（同步 + SSE）
-│   │       ├── upload.py        # /upload（文档管理）
-│   │       ├── feedback.py      # /feedback
-│   │       └── metrics.py       # /metrics（6个指标端点）
-│   ├── requirements.txt
-│   └── Dockerfile
-├── frontend/
-│   ├── src/
-│   │   ├── pages/
-│   │   │   ├── Chat.vue         # 流式问答 + 反馈按钮
-│   │   │   ├── Docs.vue         # 拖拽上传 + 质量分
-│   │   │   ├── Metrics.vue      # 6个ECharts图表
-│   │   │   └── Feedback.vue     # 满意度 + 差评分析
-│   │   ├── api/index.js         # Axios API 封装
-│   │   ├── router.js
-│   │   ├── App.vue              # 侧边栏布局
-│   │   └── styles/global.css    # 设计系统变量
-│   ├── nginx.conf
-│   └── Dockerfile
-├── tests/
-│   ├── conftest.py
-│   └── test_rag_pipeline.py     # 单元测试（30+ cases）
-├── infra/
-│   └── init.sql                 # PG 索引初始化
-├── docker-compose.yml
-├── .env                         # 环境配置
-├── deploy.sh                    # 一键部署脚本
-└── README.md
+RAG Pipeline（生产加固版）:
+  Query → SingleFlight → RAG缓存? → Rewrite(缓存)
+        → Embed(缓存) → Hybrid Search(Dense+BM25+RRF)
+        → SimpleRerank → ContextBuild → LLM(硬超时C2→C1→C0)
+        → 写缓存(版本Key) → 返回
 ```
 
 ---
@@ -109,32 +55,89 @@ rag-system/
 - 可用内存 ≥ 4GB（Milvus 需要）
 - 硅基流动 API Key：[免费注册](https://siliconflow.cn)
 
-### Step 1 — 克隆并初始化
+### Step 1 — 配置环境变量
 ```bash
-cd rag-system
+cp .env.example .env
+# 编辑 .env，填写 SILICONFLOW_API_KEY
+nano .env
+```
+
+### Step 2 — 一键部署
+```bash
 chmod +x deploy.sh
 ./deploy.sh
-# 首次运行会生成 .env 并提示填写 API Key
 ```
 
-### Step 2 — 填写 API Key
-```bash
-nano .env
-# 修改 SILICONFLOW_API_KEY=sk-your-actual-key
-```
-
-### Step 3 — 正式部署
-```bash
-./deploy.sh
-```
-
-**部署完成后访问：**
+### Step 3 — 访问服务
 
 | 服务 | 地址 |
 |------|------|
 | **前端** | http://localhost:3000 |
 | **API 文档** | http://localhost:8000/docs |
 | **MinIO 控制台** | http://localhost:9001 |
+
+---
+
+## 🧪 运行测试
+
+```bash
+# 安装测试依赖
+pip install pytest pytest-asyncio pytest-mock httpx aiosqlite rank-bm25
+
+# 运行全部测试（98个用例）
+cd rag_system
+DATABASE_URL="sqlite+aiosqlite:///test.db" \
+PYTHONPATH=backend \
+pytest tests/ -v
+
+# 只运行单元测试
+pytest tests/test_rag_pipeline.py -v
+
+# 只运行集成测试
+pytest tests/test_integration.py -v
+```
+
+**测试覆盖（98个用例，全部通过）：**
+
+| 测试模块 | 覆盖内容 |
+|----------|----------|
+| DocParser | 文件解析、HTML标签剥离、空文件处理 |
+| TextCleaner | 换行折叠、空格清理、中文保留、控制字符过滤 |
+| TextSplitter | 基础分块、空文本、句子边界、大文本、无限循环保护 |
+| QualityChecker | 空输入、有效/无效比例、分数范围 |
+| HybridRetriever | BM25检索、RRF融合、去重、线程安全 |
+| SimpleReranker | Top-N截取、关键词提升、空输入 |
+| CacheStats | 命中率计算 |
+| CacheKeys | 确定性、版本感知、无碰撞 |
+| ContextBuilder | 基础构建、长度限制、空文本跳过 |
+| RAGPipeline | 完整流程、缓存命中、超时降级、空上下文 |
+| SingleFlight | 并发去重、多Key独立 |
+| FeedbackService | 提交like/dislike、长文本截断 |
+| MilvusDB | 未连接降级、insert保护 |
+| 版本一致性 | 版本变化Key不同、无碰撞 |
+| 集成测试 | 文档处理流程、降级流程、并发安全 |
+
+---
+
+## ⚙️ 关键设计决策
+
+### 缓存版本控制（防旧缓存污染）
+```
+cache_key = f"{prefix}:{md5(query)}:{doc_version}:{embedding_version}"
+```
+- 文档上传/删除 → `doc_version++` → 旧缓存自动失效
+- Embedding模型升级 → `embedding_version++` → 向量缓存自动失效
+
+### SingleFlight 防查询风暴
+- 同一 Query 在同一时间窗口只允许 1 个请求进入 RAG 主流程
+- 后续请求等待共享结果（最多 2s 超时）
+
+### LLM 硬超时降级
+| 级别 | 超时 | 行为 |
+|------|------|------|
+| C2 | 3s | 完整生成回答 |
+| C1 | 1.5s | 轻量50字总结 |
+| C0 | - | 直接返回原始chunk |
 
 ---
 
@@ -146,100 +149,28 @@ nano .env
 | `LLM_MODEL` | | LLM 模型名 | `Qwen/Qwen2.5-7B-Instruct` |
 | `EMBED_MODEL` | | Embedding 模型 | `BAAI/bge-m3` |
 | `CHUNK_SIZE` | | 分块字符数 | `500` |
-| `CHUNK_OVERLAP` | | 分块重叠 | `50` |
-| `TOP_K` | | 检索返回数 | `10` |
-| `RERANK_TOP_N` | | 最终入 LLM 段落数 | `5` |
-| `QUALITY_THRESHOLD` | | 质量门槛（低于则拒绝）| `0.6` |
-| `CACHE_TTL_QUERY` | | Query 缓存 TTL（秒）| `1800` |
-| `CACHE_TTL_EMBED` | | Embedding 缓存 TTL | `86400` |
-| `CACHE_TTL_RAG` | | RAG 结果缓存 TTL | `3600` |
-
----
-
-## 🔌 API 接口
-
-### 查询
-```http
-POST /chat/
-Content-Type: application/json
-{"question": "什么是 RAG？", "session_id": "user-123"}
-
-GET /chat/stream?question=什么是RAG
-# SSE 流式输出
-```
-
-### 文档
-```http
-POST   /upload/               上传文档（multipart/form-data）
-GET    /upload/docs            文档列表
-DELETE /upload/docs/{doc_id}  删除文档
-```
-
-### 反馈
-```http
-POST /feedback/
-{"query":"...", "answer":"...", "feedback":"like", "log_id":1}
-
-GET /feedback/stats
-```
-
-### 指标
-```http
-GET /metrics/overview    总览卡片
-GET /metrics/rag?days=7  RAG查询指标
-GET /metrics/cache       三层缓存命中率
-GET /metrics/docs        文档质量统计
-GET /metrics/qps         近1小时QPS
-```
-
----
-
-## 🧪 运行测试
-
-```bash
-cd rag-system
-pip install pytest pytest-asyncio
-cd backend
-pip install -r requirements.txt
-cd ..
-pytest tests/ -v
-```
+| `QUALITY_THRESHOLD` | | 质量门槛 | `0.6` |
+| `CACHE_TTL_RAG` | | RAG 结果缓存 TTL（秒）| `3600` |
 
 ---
 
 ## 🔧 常用运维命令
 
 ```bash
-# 查看所有服务状态
-docker compose ps
-
-# 实时日志
-docker compose logs -f backend
-docker compose logs -f frontend
-
-# 重启后端（修改代码后）
-docker compose restart backend
-
-# 进入后端容器调试
-docker compose exec backend bash
-
-# 停止所有服务
-docker compose down
-
-# 完全清理（含所有数据卷！）
-docker compose down -v
+docker compose ps                    # 查看服务状态
+docker compose logs -f backend       # 实时后端日志
+docker compose restart backend       # 重启后端
+docker compose down                  # 停止服务
+docker compose down -v               # 完全清理（含数据卷）
 ```
 
 ---
 
-## 🔄 更换 LLM / Embedding
-
-本系统使用标准 OpenAI 兼容 API，修改 `.env` 即可切换：
+## 🔄 切换 LLM / Embedding
 
 ```bash
 # 使用 OpenAI
 SILICONFLOW_BASE_URL=https://api.openai.com/v1
-SILICONFLOW_API_KEY=sk-...
 LLM_MODEL=gpt-4o
 EMBED_MODEL=text-embedding-3-large
 EMBED_DIM=3072
@@ -251,27 +182,3 @@ LLM_MODEL=llama3.1
 EMBED_MODEL=nomic-embed-text
 EMBED_DIM=768
 ```
-
----
-
-## 📈 性能调优
-
-| 问题 | 解决方案 |
-|------|----------|
-| 检索结果不相关 | 减小 `CHUNK_SIZE`，增大 `CHUNK_OVERLAP`，检查文档质量 |
-| 响应延迟高 | 提高 `CACHE_TTL_RAG`，减小 `TOP_K` |
-| 内存不足 | Milvus 最低需 4GB，建议 8GB+ |
-| 文档入库失败 | 检查 `QUALITY_THRESHOLD`，降低至 `0.4` |
-| 缓存命中率低 | 对 Query 做 normalization（去停用词、统一标点）|
-
----
-
-## 验收清单
-
-- [ ] `docker compose up` 一键启动
-- [ ] 前端 http://localhost:3000 可访问
-- [ ] `/chat/` 返回 RAG 结果
-- [ ] 文档上传并解析入库
-- [ ] Redis 缓存生效（第二次查询 `cache_hit: true`）
-- [ ] 监控大盘显示数据
-- [ ] 用户反馈可记录

@@ -1,7 +1,9 @@
 """
 检索模块 — Hybrid Search（Dense Milvus + Sparse BM25）+ RRF 融合
+线程安全版：BM25 索引操作加锁
 """
-from typing import List, Dict, Any
+import threading
+from typing import List, Dict, Any, Optional
 
 from rank_bm25 import BM25Okapi
 from app.core.config import settings
@@ -14,34 +16,43 @@ class HybridRetriever:
 
     def __init__(self):
         self._corpus: List[str] = []
-        self._bm25:   BM25Okapi | None = None
+        self._bm25:   Optional[BM25Okapi] = None
+        self._lock = threading.Lock()
 
     def add_texts(self, texts: List[str]):
-        """新增文本到 BM25 索引"""
-        self._corpus.extend(texts)
-        tokenized  = [list(t) for t in self._corpus]
-        self._bm25 = BM25Okapi(tokenized)
+        """新增文本到 BM25 索引（线程安全）"""
+        with self._lock:
+            self._corpus.extend(texts)
+            tokenized  = [list(t) for t in self._corpus]
+            self._bm25 = BM25Okapi(tokenized)
         logger.debug(f"BM25 索引更新，共 {len(self._corpus)} 条")
 
     def reset(self):
-        self._corpus = []
-        self._bm25   = None
+        with self._lock:
+            self._corpus = []
+            self._bm25   = None
 
     # ── BM25 稀疏检索 ─────────────────────────────
 
     def _sparse_search(self, query: str, top_k: int) -> List[Dict[str, Any]]:
-        if not self._bm25 or not self._corpus:
+        with self._lock:
+            if not self._bm25 or not self._corpus:
+                return []
+            scores  = self._bm25.get_scores(list(query))
+            corpus  = list(self._corpus)  # 快照避免竞争
+
+        if len(scores) == 0:
             return []
-        scores  = self._bm25.get_scores(list(query))
+
         top_idx = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:top_k]
         return [
             {
-                "id":    f"bm25_{i}",
-                "text":  self._corpus[i],
-                "score": float(scores[i]),
+                "id":     f"bm25_{i}",
+                "text":   corpus[i],
+                "score":  float(scores[i]),
                 "source": "sparse",
             }
-            for i in top_idx if scores[i] > 0
+            for i in top_idx if i < len(corpus) and scores[i] > 0
         ]
 
     # ── RRF 融合 ──────────────────────────────────
@@ -57,18 +68,22 @@ class HybridRetriever:
         texts:  Dict[str, str]   = {}
         meta:   Dict[str, dict]  = {}
 
-        def _key(item): return item["text"][:100]
+        def _key(item): return (item.get("text") or "")[:100]
 
         for rank, item in enumerate(dense):
             key = _key(item)
+            if not key:
+                continue
             scores[key] = scores.get(key, 0) + alpha * (1 / (k + rank + 1))
-            texts[key]  = item["text"]
+            texts[key]  = item.get("text", "")
             meta[key]   = item
 
         for rank, item in enumerate(sparse):
             key = _key(item)
+            if not key:
+                continue
             scores[key] = scores.get(key, 0) + (1 - alpha) * (1 / (k + rank + 1))
-            texts[key]  = item["text"]
+            texts[key]  = item.get("text", "")
             if key not in meta:
                 meta[key] = item
 
@@ -85,7 +100,13 @@ class HybridRetriever:
 
     async def retrieve(self, query: str, query_vec: List[float], top_k: int = None) -> List[Dict]:
         top_k  = top_k or settings.TOP_K
-        dense  = milvus_db.search(query_vec, top_k=top_k)
+
+        dense: List[Dict] = []
+        try:
+            dense = milvus_db.search(query_vec, top_k=top_k)
+        except Exception as e:
+            logger.warning(f"Milvus 检索失败（降级到纯BM25）: {e}")
+
         sparse = self._sparse_search(query, top_k=top_k)
         merged = self._rrf_merge(dense, sparse)
         logger.debug(f"检索结果: dense={len(dense)}, sparse={len(sparse)}, merged={len(merged)}")

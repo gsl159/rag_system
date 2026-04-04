@@ -1,13 +1,14 @@
 """
 文档处理服务
 流程：上传 → MinIO → 解析 → 清洗 → 分块 → 质量评估 → 向量入库
+修复：错误处理、状态回滚、BM25索引更新
 """
 import os
 import re
 import uuid
 import tempfile
 from pathlib import Path
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any
 
 from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -17,8 +18,6 @@ from app.core.logger import logger
 from app.core.llm import embed_client
 from app.db.postgres import Document, Chunk
 from app.db.milvus import milvus_db
-from app.db.minio import minio_storage
-from app.rag.retriever import retriever
 
 
 class DocParser:
@@ -29,11 +28,13 @@ class DocParser:
         try:
             from unstructured.partition.auto import partition
             elements = partition(file_path)
-            texts    = [el.text for el in elements if hasattr(el, "text") and el.text]
-            return "\n".join(texts)
+            texts    = [el.text for el in elements if hasattr(el, "text") and el.text and el.text.strip()]
+            text     = "\n".join(texts)
+            if text.strip():
+                return text
         except Exception as e:
             logger.warning(f"unstructured 解析失败 ({suffix}): {e}，回退纯文本")
-            return self._fallback_parse(file_path, suffix)
+        return self._fallback_parse(file_path, suffix)
 
     def _fallback_parse(self, path: str, suffix: str) -> str:
         try:
@@ -41,14 +42,24 @@ class DocParser:
                 from html.parser import HTMLParser
                 class _Strip(HTMLParser):
                     def __init__(self):
-                        super().__init__(); self.parts = []
-                    def handle_data(self, d): self.parts.append(d)
+                        super().__init__()
+                        self.parts = []
+                        self._skip = False
+                    def handle_starttag(self, tag, attrs):
+                        if tag in ("script", "style"):
+                            self._skip = True
+                    def handle_endtag(self, tag):
+                        if tag in ("script", "style"):
+                            self._skip = False
+                    def handle_data(self, d):
+                        if not self._skip and d.strip():
+                            self.parts.append(d.strip())
                 p = _Strip()
                 p.feed(Path(path).read_text("utf-8", errors="ignore"))
                 return " ".join(p.parts)
             return Path(path).read_text("utf-8", errors="ignore")
         except Exception as e:
-            logger.error(f"回退解析也失败: {e}")
+            logger.error(f"回退解析失败: {e}")
             return ""
 
 
@@ -56,10 +67,12 @@ class TextCleaner:
     """文本清洗"""
 
     def clean(self, text: str) -> str:
+        if not text:
+            return ""
         text = re.sub(r"\r\n", "\n", text)
         text = re.sub(r"\n{3,}", "\n\n", text)
-        text = re.sub(r" {3,}", " ", text)
-        # 保留 ASCII + 中文 + 标点
+        text = re.sub(r"[ \t]{3,}", " ", text)
+        # 保留 ASCII + 中文 + 常用标点
         text = re.sub(
             r"[^\x09\x0a\x0d\x20-\x7e"
             r"\u4e00-\u9fa5\u3000-\u303f\uff00-\uffef"
@@ -74,9 +87,11 @@ class TextSplitter:
 
     def __init__(self, chunk_size: int = None, overlap: int = None):
         self.chunk_size = chunk_size or settings.CHUNK_SIZE
-        self.overlap    = overlap    or settings.CHUNK_OVERLAP
+        self.overlap    = max(0, overlap or settings.CHUNK_OVERLAP)
 
     def split(self, text: str) -> List[str]:
+        if not text or not text.strip():
+            return []
         chunks = []
         start  = 0
         while start < len(text):
@@ -90,7 +105,10 @@ class TextSplitter:
             chunk = text[start:end].strip()
             if chunk:
                 chunks.append(chunk)
-            start = end - self.overlap
+            next_start = end - self.overlap
+            if next_start <= start:
+                next_start = start + 1
+            start = next_start
         return chunks
 
 
@@ -102,9 +120,8 @@ class QualityChecker:
             return {"score": 0.0, "valid_ratio": 0.0, "avg_length": 0, "total": 0, "valid": 0}
         valid   = [c for c in chunks if len(c.strip()) >= 20]
         avg_len = sum(len(c) for c in chunks) / len(chunks)
-        # 综合评分：有效比例 * 0.7 + 平均长度分 * 0.3
         len_score = min(avg_len / 200, 1.0)
-        score     = len(valid) / len(chunks) * 0.7 + len_score * 0.3
+        score     = (len(valid) / len(chunks)) * 0.7 + len_score * 0.3
         return {
             "score":       round(score, 4),
             "valid_ratio": round(len(valid) / len(chunks), 4),
@@ -114,14 +131,12 @@ class QualityChecker:
         }
 
 
-# ── 服务入口 ──────────────────────────────────
-
 class DocumentService:
     def __init__(self):
-        self.parser  = DocParser()
-        self.cleaner = TextCleaner()
-        self.splitter= TextSplitter()
-        self.checker = QualityChecker()
+        self.parser   = DocParser()
+        self.cleaner  = TextCleaner()
+        self.splitter = TextSplitter()
+        self.checker  = QualityChecker()
 
     async def process(self, doc_id: str, file_path: str, db: AsyncSession):
         logger.info(f"开始处理文档 doc_id={doc_id}")
@@ -129,30 +144,35 @@ class DocumentService:
 
         try:
             # 1. 解析
-            raw  = self.parser.parse(file_path)
-            if not raw:
+            raw = self.parser.parse(file_path)
+            if not raw or not raw.strip():
                 raise ValueError("文档内容为空，无法解析")
 
             # 2. 清洗
             text = self.cleaner.clean(raw)
+            if not text:
+                raise ValueError("清洗后内容为空")
 
             # 3. 分块
             chunks = self.splitter.split(text)
+            if not chunks:
+                raise ValueError("分块结果为空")
 
             # 4. 质量评估
             quality = self.checker.evaluate(chunks)
-            logger.info(f"文档 {doc_id} 质量: {quality}")
+            logger.info(f"文档 {doc_id} 质量: score={quality['score']:.3f}, chunks={quality['total']}")
 
             if quality["score"] < settings.QUALITY_THRESHOLD:
                 raise ValueError(
-                    f"质量分 {quality['score']:.2f} < 阈值 {settings.QUALITY_THRESHOLD}，拒绝入库"
+                    f"质量分 {quality['score']:.2f} < 阈值 {settings.QUALITY_THRESHOLD}"
                 )
 
-            # 5. Embedding
+            # 5. Embedding（批量）
+            logger.info(f"开始 Embedding {len(chunks)} 个 chunk...")
             embeddings = await embed_client.embed_batch(chunks)
 
             # 6. Milvus 入库
-            chunk_ids  = [str(uuid.uuid4()) for _ in chunks]
+            chunk_ids = [str(uuid.uuid4()) for _ in chunks]
             milvus_db.insert(
                 ids        = chunk_ids,
                 doc_ids    = [doc_id] * len(chunks),
@@ -162,9 +182,10 @@ class DocumentService:
             )
 
             # 7. BM25 索引更新
+            from app.rag.retriever import retriever
             retriever.add_texts(chunks)
 
-            # 8. PostgreSQL 入库
+            # 8. PostgreSQL 入库 Chunk 记录
             chunk_rows = [
                 Chunk(
                     id        = chunk_ids[i],
@@ -172,7 +193,7 @@ class DocumentService:
                     content   = chunks[i],
                     chunk_idx = i,
                     char_count= len(chunks[i]),
-                    meta_info  = {"doc_id": doc_id, "idx": i},
+                    meta_info = {"doc_id": doc_id, "idx": i},
                 )
                 for i in range(len(chunks))
             ]
@@ -187,19 +208,26 @@ class DocumentService:
                 )
             )
             await db.commit()
-            logger.info(f"文档 {doc_id} 处理完成，{len(chunks)} 个 chunk")
+            logger.info(f"✅ 文档 {doc_id} 处理完成，{len(chunks)} 个 chunk")
 
         except Exception as e:
-            logger.error(f"文档 {doc_id} 处理失败: {e}")
-            await self._set_status(db, doc_id, "failed", str(e))
+            logger.error(f"❌ 文档 {doc_id} 处理失败: {e}")
+            try:
+                await db.rollback()
+                await self._set_status(db, doc_id, "failed", str(e))
+            except Exception as inner_e:
+                logger.error(f"状态回滚失败: {inner_e}")
             raise
 
     async def _set_status(self, db: AsyncSession, doc_id: str, status: str, error: str = None):
-        vals = {"status": status}
+        vals: Dict[str, Any] = {"status": status}
         if error:
             vals["error_msg"] = error[:500]
-        await db.execute(update(Document).where(Document.id == doc_id).values(**vals))
-        await db.commit()
+        try:
+            await db.execute(update(Document).where(Document.id == doc_id).values(**vals))
+            await db.commit()
+        except Exception as e:
+            logger.error(f"_set_status 失败: {e}")
 
 
 doc_service = DocumentService()

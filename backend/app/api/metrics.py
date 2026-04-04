@@ -20,16 +20,17 @@ async def overview(db: AsyncSession = Depends(get_db)):
     query_total = (await db.execute(select(func.count()).select_from(QueryLog))).scalar() or 0
     avg_score   = (await db.execute(select(func.avg(Evaluation.overall)))).scalar() or 0
     avg_lat     = (await db.execute(select(func.avg(QueryLog.latency_ms)))).scalar() or 0
-    cache_stats = await cache.get_stats()
-    milvus_stats= milvus_db.get_stats()
+
+    cache_stats  = await cache.get_stats()
+    milvus_stats = milvus_db.get_stats()
 
     return {
-        "doc_count":       doc_total,
-        "query_count":     query_total,
-        "avg_score":       round(avg_score, 2),
-        "avg_latency_ms":  round(avg_lat, 1),
-        "cache_hit_rate":  cache_stats.get("redis_hit_rate", 0),
-        "vector_count":    milvus_stats.get("total_entities", 0),
+        "doc_count":      doc_total,
+        "query_count":    query_total,
+        "avg_score":      round(float(avg_score), 2),
+        "avg_latency_ms": round(float(avg_lat), 1),
+        "cache_hit_rate": cache_stats.get("redis_hit_rate", 0),
+        "vector_count":   milvus_stats.get("total_entities", 0),
     }
 
 
@@ -69,30 +70,31 @@ async def doc_metrics(db: AsyncSession = Depends(get_db)):
             func.count().label("cnt"),
         )
         .where(Document.status == "done")
-        .group_by("bucket")
-        .order_by("bucket")
+        .group_by(func.round(Document.parse_score, 1))
+        .order_by(func.round(Document.parse_score, 1))
     )
 
     # 最近上传
     recent_r = await db.execute(
-        select(Document.filename, Document.parse_score, Document.chunk_count, Document.status, Document.created_at)
+        select(Document.filename, Document.parse_score, Document.chunk_count,
+               Document.status, Document.created_at)
         .order_by(Document.created_at.desc())
         .limit(10)
     )
 
     return {
         "status_counts": status_map,
-        "avg_score":     round(avg_score, 3),
-        "avg_chunks":    round(avg_chunks, 1),
+        "avg_score":     round(float(avg_score), 3),
+        "avg_chunks":    round(float(avg_chunks), 1),
         "score_dist": [
             {"score": str(r.bucket), "count": r.cnt} for r in dist_r
         ],
         "recent_docs": [
             {
-                "filename":  r.filename,
-                "score":     round(r.parse_score or 0, 2),
-                "chunks":    r.chunk_count,
-                "status":    r.status,
+                "filename":   r.filename,
+                "score":      round(float(r.parse_score or 0), 2),
+                "chunks":     r.chunk_count,
+                "status":     r.status,
                 "created_at": r.created_at.isoformat() if r.created_at else None,
             }
             for r in recent_r
@@ -111,7 +113,7 @@ async def qps(db: AsyncSession = Depends(get_db)):
             func.count().label("count"),
         )
         .where(QueryLog.created_at >= since)
-        .group_by("minute")
-        .order_by("minute")
+        .group_by(func.date_trunc("minute", QueryLog.created_at))
+        .order_by(func.date_trunc("minute", QueryLog.created_at))
     )
     return [{"minute": str(r.minute), "count": r.count} for r in result]

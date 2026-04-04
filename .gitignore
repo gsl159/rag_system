@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# 环境配置（不提交真实密钥）
+.env
+!.env.example
+
+# 测试产物
+.pytest_cache/
+*.db
+*.sqlite
+htmlcov/
+.coverage
+coverage.xml
+
+# 日志
+logs/
+*.log
+
+# Node / 前端
+node_modules/
+frontend/dist/
+frontend/.vite/
+
+# 编辑器
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Docker 运行时数据
+infra/data/

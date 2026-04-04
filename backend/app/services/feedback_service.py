@@ -27,10 +27,10 @@ class FeedbackService:
         fb = Feedback(
             log_id     = log_id,
             session_id = session_id,
-            query      = query,
-            answer     = answer,
+            query      = (query or "")[:1000],
+            answer     = (answer or "")[:2000],
             feedback   = feedback,
-            comment    = comment,
+            comment    = (comment or "")[:500] if comment else None,
         )
         db.add(fb)
         await db.commit()
@@ -38,7 +38,7 @@ class FeedbackService:
         return fb
 
     async def get_stats(self, db: AsyncSession) -> Dict[str, Any]:
-        like_r    = (await db.execute(
+        like_r = (await db.execute(
             select(func.count()).select_from(Feedback).where(Feedback.feedback == "like")
         )).scalar() or 0
 
@@ -48,7 +48,6 @@ class FeedbackService:
 
         total = like_r + dislike_r
 
-        # Top 10 差评问题
         bad_r = await db.execute(
             select(Feedback.query, Feedback.comment, Feedback.created_at)
             .where(Feedback.feedback == "dislike")
@@ -56,7 +55,6 @@ class FeedbackService:
             .limit(10)
         )
 
-        # 最近20条反馈
         recent_r = await db.execute(
             select(Feedback.query, Feedback.feedback, Feedback.comment, Feedback.created_at)
             .order_by(desc(Feedback.created_at))
@@ -70,12 +68,12 @@ class FeedbackService:
             "like_ratio":   round(like_r / total, 3) if total else 0,
             "satisfaction": round(like_r / total * 100, 1) if total else 0,
             "top_bad_queries": [
-                {"query": r.query[:80], "comment": r.comment}
+                {"query": (r.query or "")[:80], "comment": r.comment}
                 for r in bad_r
             ],
             "recent": [
                 {
-                    "query":    r.query[:60],
+                    "query":    (r.query or "")[:60],
                     "feedback": r.feedback,
                     "comment":  r.comment,
                     "time":     r.created_at.isoformat() if r.created_at else None,

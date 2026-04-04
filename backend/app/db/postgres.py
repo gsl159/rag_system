@@ -1,12 +1,13 @@
 """
 PostgreSQL — 异步 SQLAlchemy ORM 定义
+新增：doc_version 用于缓存强一致性版本控制
 """
 from datetime import datetime
 from typing import AsyncGenerator
 
 from sqlalchemy import (
     Column, String, Float, Integer, Boolean,
-    Text, BigInteger, ForeignKey, DateTime, JSON
+    Text, BigInteger, ForeignKey, DateTime, JSON, Index
 )
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase
@@ -14,7 +15,13 @@ from sqlalchemy.orm import DeclarativeBase
 from app.core.config import settings
 
 
-engine = create_async_engine(settings.DATABASE_URL, echo=False, pool_pre_ping=True)
+engine = create_async_engine(
+    settings.DATABASE_URL,
+    echo=False,
+    pool_pre_ping=True,
+    pool_size=10,
+    max_overflow=20,
+)
 AsyncSessionLocal = async_sessionmaker(engine, expire_on_commit=False)
 
 
@@ -34,9 +41,15 @@ class Document(Base):
     status      = Column(String(20),  default="pending")   # pending/processing/done/failed
     parse_score = Column(Float,       default=0.0)
     chunk_count = Column(Integer,     default=0)
+    doc_version = Column(Integer,     default=1)           # 版本控制：更新时自增
     error_msg   = Column(Text)
     created_at  = Column(DateTime,    default=datetime.utcnow)
     updated_at  = Column(DateTime,    default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    __table_args__ = (
+        Index("idx_docs_status", "status"),
+        Index("idx_docs_created", "created_at"),
+    )
 
 
 class Chunk(Base):
@@ -46,8 +59,12 @@ class Chunk(Base):
     content    = Column(Text,        nullable=False)
     chunk_idx  = Column(Integer,     nullable=False)
     char_count = Column(Integer,     default=0)
-    meta_info   = Column(JSON,        default=dict)
+    meta_info  = Column(JSON,        default=dict)
     created_at = Column(DateTime,    default=datetime.utcnow)
+
+    __table_args__ = (
+        Index("idx_chunks_doc_id", "doc_id"),
+    )
 
 
 class QueryLog(Base):
@@ -61,7 +78,13 @@ class QueryLog(Base):
     latency_ms      = Column(Integer)
     cache_hit       = Column(Boolean,  default=False)
     token_count     = Column(Integer,  default=0)
+    degrade_level   = Column(String(4))                    # C0/C1/C2
     created_at      = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        Index("idx_qlog_created", "created_at"),
+        Index("idx_qlog_cache", "cache_hit"),
+    )
 
 
 class Evaluation(Base):
@@ -77,6 +100,10 @@ class Evaluation(Base):
     reason       = Column(Text)
     created_at   = Column(DateTime, default=datetime.utcnow)
 
+    __table_args__ = (
+        Index("idx_eval_created", "created_at"),
+    )
+
 
 class Feedback(Base):
     __tablename__ = "feedback"
@@ -89,12 +116,20 @@ class Feedback(Base):
     comment    = Column(Text)
     created_at = Column(DateTime, default=datetime.utcnow)
 
+    __table_args__ = (
+        Index("idx_fb_type", "feedback"),
+    )
+
 
 # ── Session dependency ────────────────────────
 
 async def get_db() -> AsyncGenerator[AsyncSession, None]:
     async with AsyncSessionLocal() as session:
-        yield session
+        try:
+            yield session
+        except Exception:
+            await session.rollback()
+            raise
 
 
 async def init_db():

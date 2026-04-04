@@ -1,7 +1,7 @@
 """
-Reranker — LLM 交叉编码重排
-对候选文档按与 query 的相关性打分后重新排序
+Reranker — LLM 交叉编码重排 + 简单关键词重排
 """
+import asyncio
 from typing import List, Dict, Any
 
 from app.core.llm import llm_client
@@ -22,9 +22,8 @@ class LLMReranker:
         if len(docs) <= top_n:
             return docs
 
-        # 构建打分 prompt
         passages = "\n".join(
-            f"[{i}] {d['text'][:300]}" for i, d in enumerate(docs)
+            f"[{i}] {(d.get('text') or '')[:300]}" for i, d in enumerate(docs)
         )
         prompt = f"""你是一个检索相关性评分专家。
 请对以下每个段落与用户问题的相关性进行打分（0-10分），并以 JSON 返回。
@@ -39,8 +38,9 @@ class LLMReranker:
 其中数组长度与候选段落数量相同。"""
 
         try:
-            result = await llm_client.chat_json(
-                [{"role": "user", "content": prompt}]
+            result = await asyncio.wait_for(
+                llm_client.chat_json([{"role": "user", "content": prompt}]),
+                timeout=2.0,
             )
             scores = result.get("scores", [])
             if len(scores) == len(docs):
@@ -50,10 +50,12 @@ class LLMReranker:
                     reverse=True,
                 )
                 reranked = [doc for _, doc in ranked[:top_n]]
-                for i, (score, doc) in enumerate(zip([s for s, _ in ranked[:top_n]], reranked)):
-                    reranked[i]["rerank_score"] = score
-                logger.debug(f"Rerank 完成，top_n={top_n}, scores={scores[:top_n]}")
+                for i, (score, _) in enumerate(zip([s for s, _ in ranked[:top_n]], reranked)):
+                    reranked[i]["rerank_score"] = float(score)
+                logger.debug(f"Rerank 完成，top_n={top_n}")
                 return reranked
+        except asyncio.TimeoutError:
+            logger.warning("LLM Reranker 超时，回退到简单重排")
         except Exception as e:
             logger.warning(f"Rerank 失败，回退原序: {e}")
 
@@ -64,13 +66,16 @@ class SimpleReranker:
     """轻量 Reranker：关键词覆盖率打分（无 API 调用）"""
 
     def rerank(self, query: str, docs: List[Dict], top_n: int = 5) -> List[Dict]:
-        keywords = set(query)
+        if not docs:
+            return []
+        keywords = set(query) if query else set()
         for doc in docs:
-            text     = doc.get("text", "")
-            coverage = sum(1 for kw in keywords if kw in text) / max(len(keywords), 1)
-            doc["rerank_score"] = doc.get("rrf_score", 0) * 0.7 + coverage * 0.3
-        return sorted(docs, key=lambda d: d["rerank_score"], reverse=True)[:top_n]
+            text     = doc.get("text") or ""
+            coverage = sum(1 for kw in keywords if kw in text) / max(len(keywords), 1) if keywords else 0
+            rrf      = doc.get("rrf_score", 0)
+            doc["rerank_score"] = round(rrf * 0.7 + coverage * 0.3, 6)
+        return sorted(docs, key=lambda d: d.get("rerank_score", 0), reverse=True)[:top_n]
 
 
-reranker = LLMReranker()
+reranker        = LLMReranker()
 simple_reranker = SimpleReranker()
