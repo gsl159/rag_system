@@ -192,7 +192,7 @@ class TestDegradationFlow:
 
         with patch("app.rag.pipeline.llm_client") as mock:
             mock.chat = mock_chat
-            answer, level = await generate_answer("问题", "上下文", timeout=0.01)
+            answer, level, _ = await generate_answer("问题", "上下文")
 
         assert level in ("C1", "C0")
 

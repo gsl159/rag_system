@@ -1,5 +1,5 @@
 """
-全局配置 — 所有配置从环境变量读取，禁止硬编码
+全局配置 — 所有配置从环境变量读取
 """
 from functools import lru_cache
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -11,7 +11,7 @@ class Settings(BaseSettings):
     # LLM
     SILICONFLOW_API_KEY: str = "sk-placeholder"
     SILICONFLOW_BASE_URL: str = "https://api.siliconflow.cn/v1"
-    LLM_MODEL: str = "deepseek-ai/DeepSeek-V2.5"
+    LLM_MODEL: str = "Qwen/Qwen2.5-7B-Instruct"
     EMBED_MODEL: str = "BAAI/bge-m3"
     EMBED_DIM: int = 1024
 
@@ -44,6 +44,13 @@ class Settings(BaseSettings):
     CACHE_TTL_QUERY: int = 1800
     CACHE_TTL_EMBED: int = 86400
     CACHE_TTL_RAG: int = 3600
+
+    # Auth & Security
+    JWT_SECRET: str = "rag-system-jwt-secret-change-in-production"
+    JWT_ALGORITHM: str = "HS256"
+    JWT_EXPIRE_HOURS: int = 24
+    # 限流：每分钟最多请求数
+    RATE_LIMIT_PER_MINUTE: int = 60
 
     # App
     LOG_LEVEL: str = "INFO"

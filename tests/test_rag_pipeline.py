@@ -476,7 +476,7 @@ class TestRAGPipeline:
     @pytest.mark.asyncio
     async def test_run_rag_pipeline_basic(self):
         with patch.dict("sys.modules", {"redis": MagicMock(), "redis.asyncio": MagicMock()}):
-            from app.rag.pipeline import run_rag_pipeline, _run_rag_internal
+            from app.rag.pipeline import run_rag_pipeline
             with patch("app.rag.pipeline.cache") as mc, \
                  patch("app.rag.pipeline.embed_client") as me, \
                  patch("app.rag.pipeline.retriever") as mr, \
@@ -534,7 +534,7 @@ class TestRAGPipeline:
     async def test_empty_context_no_crash(self):
         with patch.dict("sys.modules", {"redis": MagicMock(), "redis.asyncio": MagicMock()}):
             from app.rag.pipeline import generate_answer
-            answer, level = await generate_answer("问题", "")
+            answer, level, _ = await generate_answer("问题", "")
         assert level == "C0"
         assert answer
 
@@ -544,7 +544,7 @@ class TestRAGPipeline:
             from app.rag.pipeline import generate_answer
             with patch("app.rag.pipeline.llm_client") as ml:
                 ml.chat = AsyncMock(return_value="完整回答")
-                answer, level = await generate_answer("问题", "上下文", timeout=3.0)
+                answer, level, _ = await generate_answer("问题", "上下文")
         assert answer == "完整回答"
         assert level == "C2"
 
