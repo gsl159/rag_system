@@ -179,7 +179,7 @@ class RedisCache:
             except Exception:
                 return None
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         fut: asyncio.Future = loop.create_future()
         _inflight[key] = fut
         try:

@@ -98,7 +98,15 @@ const queue       = ref([])
 const dragging    = ref(false)
 const docsLoading = ref(false)
 
-onMounted(loadDocs)
+onMounted(() => {
+  loadDocs()
+  // 处理中的文档自动轮询
+  setInterval(() => {
+    if (docs.value.some(d => d.status === 'processing' || d.status === 'pending')) {
+      loadDocs()
+    }
+  }, 4000)
+})
 
 async function loadDocs() {
   docsLoading.value = true

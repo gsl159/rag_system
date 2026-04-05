@@ -43,7 +43,6 @@ services:
     volumes:
       - minio_data:/data
     healthcheck:
-      # 用 mc 命令直接探活，比 HTTP 端点可靠得多
       test: ["CMD", "mc", "ready", "local"]
       interval: 10s
       timeout: 10s
@@ -51,7 +50,6 @@ services:
       start_period: 30s
     restart: unless-stopped
 
-  # 创建 Milvus 所需的 bucket，完成后自动退出
   minio-init:
     image: minio/mc:latest
     logging: *default-logging
@@ -144,10 +142,12 @@ services:
       - "8000:8000"
     env_file: .env
     environment:
+      # 服务发现（覆盖 .env 中的 localhost 配置）
       DATABASE_URL:   postgresql+asyncpg://raguser:ragpass123@postgres:5432/ragdb
       REDIS_URL:      redis://redis:6379/0
       MILVUS_HOST:    milvus
       MINIO_ENDPOINT: minio:9000
+      APP_ENV:        production
     depends_on:
       postgres:
         condition: service_healthy
@@ -158,6 +158,12 @@ services:
     volumes:
       - backend_logs:/app/logs
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      start_period: 60s
+      retries: 3
 
   frontend:
     build:
@@ -167,7 +173,8 @@ services:
     ports:
       - "3000:80"
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
     restart: unless-stopped
 
 volumes:

@@ -1,15 +1,16 @@
 """
-/chat 路由 — 同步 + SSE 流式，含 trace_id、限流、审计
+/chat 路由 — 同步 + SSE 流式
+修复：SSE 流式接口 EventSource 不支持 Header，改为 query param token 认证
 """
-import time
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Request
+from typing import Optional
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Request, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.logger import logger
 from app.core.response import ok
-from app.core.security import get_current_user, check_rate_limit, generate_trace_id
+from app.core.security import get_current_user, check_rate_limit, generate_trace_id, verify_token
 from app.db.postgres import get_db, QueryLog, AuditLog
 from app.db.redis import cache
 from app.rag.pipeline import run_rag_pipeline, run_rag_stream
@@ -20,7 +21,7 @@ router = APIRouter(prefix="/chat", tags=["RAG 查询"])
 
 class ChatRequest(BaseModel):
     question:   str
-    session_id: str | None = None
+    session_id: Optional[str] = None
 
 
 @router.post("/")
@@ -30,8 +31,9 @@ async def chat(
     background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
     user: dict = Depends(get_current_user),
-    _rl = Depends(check_rate_limit),
+    _rl=Depends(check_rate_limit),
 ):
+    """同步 RAG 查询，返回完整结果"""
     question = (req.question or "").strip()
     if not question:
         raise HTTPException(400, detail={"code": 1001, "message": "问题不能为空"})
@@ -71,8 +73,10 @@ async def chat(
         degrade_reason  = result.get("degrade_reason", ""),
     )
     db.add(log)
-    db.add(AuditLog(trace_id=trace_id, user_id=user_id, action="query",
-                    resource=question[:100], ip=request.client.host if request.client else None))
+    db.add(AuditLog(
+        trace_id=trace_id, user_id=user_id, action="query",
+        resource=question[:100], ip=request.client.host if request.client else None,
+    ))
     try:
         await db.flush()
         log_id = log.id
@@ -84,8 +88,8 @@ async def chat(
     # 后台评估（非缓存结果）
     if not result.get("cache_hit") and result.get("answer") and log_id:
         background_tasks.add_task(
-            _async_evaluate, question, result.get("answer", ""),
-            result.get("context", ""), log_id,
+            _async_evaluate, question,
+            result.get("answer", ""), result.get("context", ""), log_id,
         )
 
     return ok({
@@ -106,33 +110,56 @@ async def _async_evaluate(query: str, answer: str, context: str, log_id: int):
     try:
         from app.db.postgres import AsyncSessionLocal
         async with AsyncSessionLocal() as db:
-            await eval_service.evaluate(query=query, answer=answer, context=context,
-                                        log_id=log_id, db=db)
+            await eval_service.evaluate(
+                query=query, answer=answer, context=context, log_id=log_id, db=db,
+            )
     except Exception as e:
         logger.warning(f"后台评估失败: {e}")
 
 
 @router.get("/stream")
 async def chat_stream(
-    question: str,
-    request: Request,
-    user: dict = Depends(get_current_user),
+    question: str = Query(...),
+    token: Optional[str] = Query(None),   # 修复：SSE 用 query param 传 token
+    request: Request = None,
 ):
+    """
+    SSE 流式输出
+    修复：EventSource 不支持自定义 Header，改从 query param 读取 token
+    """
     q = (question or "").strip()
     if not q:
         raise HTTPException(400, detail={"code": 1001, "message": "问题不能为空"})
+
+    # 从 query param 验证 token（开发环境跳过）
+    from app.core.config import settings
+    if settings.APP_ENV != "development":
+        if not token:
+            raise HTTPException(401, detail={"code": 1002, "message": "未提供认证令牌"})
+        payload = verify_token(token)
+        if not payload:
+            raise HTTPException(401, detail={"code": 1002, "message": "令牌无效或已过期"})
+
     trace_id = generate_trace_id()
 
     async def gen():
         try:
-            async for token in run_rag_stream(q, trace_id=trace_id):
-                safe = token.replace("\n", "\\n")
-                yield f"data: {safe}\n\n"
+            async for tok in run_rag_stream(q, trace_id=trace_id):
+                if not tok:
+                    continue
+                # SSE: 多行内容用 data: 逐行发送
+                for line in tok.split("\n"):
+                    yield f"data: {line}\n\n"
         except Exception as e:
             yield f"data: [ERROR] {str(e)[:200]}\n\n"
         yield "data: [DONE]\n\n"
 
-    return StreamingResponse(gen(), media_type="text/event-stream",
-                             headers={"Cache-Control": "no-cache",
-                                      "X-Accel-Buffering": "no",
-                                      "X-Trace-Id": trace_id})
+    return StreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "X-Trace-Id": trace_id,
+        },
+    )

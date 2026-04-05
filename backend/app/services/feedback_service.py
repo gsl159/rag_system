@@ -1,7 +1,5 @@
 """
-用户反馈服务
-- 记录 👍 / 👎
-- 统计 like_ratio, top_bad_queries
+用户反馈服务 — 修复: user_id + db 参数顺序规范化
 """
 from typing import Dict, Any, Optional
 
@@ -22,11 +20,13 @@ class FeedbackService:
         comment:    Optional[str],
         log_id:     Optional[int],
         session_id: Optional[str],
-        db:         AsyncSession,
+        db:         AsyncSession,            # db 必须位置，避免与 user_id 混淆
+        user_id:    Optional[str] = None,    # user_id 放最后，有默认值
     ) -> Feedback:
         fb = Feedback(
             log_id     = log_id,
             session_id = session_id,
+            user_id    = user_id,
             query      = (query or "")[:1000],
             answer     = (answer or "")[:2000],
             feedback   = feedback,
@@ -34,7 +34,7 @@ class FeedbackService:
         )
         db.add(fb)
         await db.commit()
-        logger.info(f"反馈记录: feedback={feedback}, log_id={log_id}")
+        logger.info(f"反馈记录: feedback={feedback}, log_id={log_id}, user={user_id}")
         return fb
 
     async def get_stats(self, db: AsyncSession) -> Dict[str, Any]:

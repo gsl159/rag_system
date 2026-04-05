@@ -23,16 +23,15 @@ class TestDocProcessingFlow:
         """验证文档处理完整流程不报错"""
         from app.services.doc_service import DocParser, TextCleaner, TextSplitter, QualityChecker
 
-        # 创建测试文件
         f = tmp_path / "test.txt"
         f.write_text("这是一段测试文档内容。" * 100, encoding="utf-8")
 
-        parser  = DocParser()
-        cleaner = TextCleaner()
+        parser   = DocParser()
+        cleaner  = TextCleaner()
         splitter = TextSplitter(chunk_size=200, overlap=20)
-        checker = QualityChecker()
+        checker  = QualityChecker()
 
-        raw    = parser._fallback_parse(str(f), ".txt")
+        raw    = parser.parse(str(f))
         text   = cleaner.clean(raw)
         chunks = splitter.split(text)
         qual   = checker.evaluate(chunks)
@@ -55,7 +54,7 @@ class TestDocProcessingFlow:
         from app.services.doc_service import DocParser, TextCleaner
         parser  = DocParser()
         cleaner = TextCleaner()
-        raw  = parser._fallback_parse(str(f), ".html")
+        raw  = parser.parse(str(f))
         text = cleaner.clean(raw)
 
         assert "企业知识库" in text

@@ -2,12 +2,8 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# 系统依赖（unstructured PDF/docx 解析需要）
+# 系统依赖（极简版：仅 curl 用于健康检查，pymupdf 自带 MuPDF）
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libmagic1 \
-    poppler-utils \
-    tesseract-ocr \
-    libreoffice \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
@@ -23,5 +19,4 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
     CMD curl -f http://localhost:8000/health || exit 1
 
-# 生产环境不用 --reload
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]

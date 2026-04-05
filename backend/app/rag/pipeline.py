@@ -19,15 +19,13 @@ from app.rag.reranker import simple_reranker
 
 async def classify_intent(query: str) -> str:
     """
-    C0 = FAQ/简单/可缓存
-    C1 = 轻量总结
-    C2 = 复杂生成
+    C0 = FAQ/简单/可缓存  (< 15字 或含定义类关键词)
+    C1 = 轻量总结         (15~40字)
+    C2 = 复杂生成         (> 40字)
     """
     q = query.strip()
-    # 短问题或含关键词 → C0
-    if len(q) < 15 or any(kw in q for kw in ["是什么", "定义", "什么叫", "怎么读"]):
+    if len(q) < 15 or any(kw in q for kw in ["是什么", "定义", "什么叫", "怎么读", "含义"]):
         return "C0"
-    # 中等长度 → C1
     if len(q) < 40:
         return "C1"
     return "C2"
@@ -46,7 +44,11 @@ async def rewrite_query(query: str) -> str:
             timeout=3.0,
         )
         return result.strip() or query
-    except Exception:
+    except asyncio.TimeoutError:
+        logger.warning("Query Rewrite 超时，使用原始 query")
+        return query
+    except Exception as e:
+        logger.warning(f"Query Rewrite 失败: {e}")
         return query
 
 
@@ -142,24 +144,45 @@ async def llm_self_score(query: str, answer: str) -> float:
             llm_client.chat([{"role": "user", "content": prompt}], temperature=0, max_tokens=10),
             timeout=2.0,
         )
-        return max(0.0, min(1.0, float(result.strip())))
+        score = float(result.strip())
+        return max(0.0, min(1.0, score))
     except Exception:
         return 0.5
 
 
-# ── 置信度计算 ────────────────────────────────
+# ── 置信度计算（修复归一化）─────────────────
 
 def calc_confidence(top_docs: List[Dict], embedding_sim: float, llm_score: float) -> float:
     """
-    confidence = 0.5×rerank_avg + 0.3×embedding_sim + 0.2×llm_self_score
+    confidence = 0.5×rerank_norm + 0.3×embedding_sim + 0.2×llm_self_score
+
+    修复：SimpleReranker 的 rerank_score = rrf*0.7 + coverage*0.3
+    rrf_score 通常 < 0.02，直接用原值太小。
+    根据实际范围动态归一化：
+      - 若最大值 > 1  → 认为是 LLMReranker（0~10分），除以 10
+      - 若最大值 <= 1 → 认为是 SimpleReranker（0~1范围），直接用
     """
     if not top_docs:
         return 0.0
+
     rerank_scores = [d.get("rerank_score", 0) for d in top_docs]
+    max_score = max(rerank_scores) if rerank_scores else 0
     rerank_avg = sum(rerank_scores) / len(rerank_scores) if rerank_scores else 0
-    # rerank_score 原始值范围不固定，归一化到 0~1
-    rerank_norm = min(rerank_avg / 10.0, 1.0)  # LLMReranker 用 0-10 分
-    conf = 0.5 * rerank_norm + 0.3 * embedding_sim + 0.2 * llm_score
+
+    # 动态归一化
+    if max_score > 1.0:
+        # LLMReranker：分数 0~10
+        rerank_norm = min(rerank_avg / 10.0, 1.0)
+    else:
+        # SimpleReranker：分数 0~1（但实际极小，放大修正）
+        # rrf ≈ 0.007~0.016，coverage ≈ 0~1
+        # 将 rerank_score 映射到合理范围：min(score * 20, 1.0)
+        rerank_norm = min(rerank_avg * 20.0, 1.0)
+
+    # embedding_sim 是 Milvus COSINE 相似度，范围 0~1
+    emb_norm = max(0.0, min(1.0, float(embedding_sim)))
+
+    conf = 0.5 * rerank_norm + 0.3 * emb_norm + 0.2 * llm_score
     return round(min(conf, 1.0), 3)
 
 
@@ -168,8 +191,8 @@ def calc_confidence(top_docs: List[Dict], embedding_sim: float, llm_score: float
 async def run_rag_pipeline(
     query: str,
     doc_version: int = 0,
-    session_id: str = None,
-    user_id: str = None,
+    session_id: Optional[str] = None,
+    user_id: Optional[str] = None,
     trace_id: str = "",
 ) -> Dict[str, Any]:
     t0 = time.time()
@@ -195,11 +218,18 @@ async def run_rag_pipeline(
     except Exception as e:
         logger.error(f"[{trace_id}] RAG pipeline 异常: {e}")
         return {
-            "answer": "系统暂时繁忙，请稍后重试。",
-            "sources": [], "context": "", "confidence": 0.0,
-            "rewritten_query": query, "intent": "C0",
-            "cache_hit": False, "latency_ms": int((time.time() - t0) * 1000),
-            "degrade_level": "C0", "degrade_reason": "SYSTEM_ERROR",
+            "answer":          "系统暂时繁忙，请稍后重试。",
+            "sources":         [],
+            "context":         "",
+            "confidence":      0.0,
+            "rewritten_query": query,
+            "intent":          "C0",
+            "cache_hit":       False,
+            "latency_ms":      int((time.time() - t0) * 1000),
+            "retrieval_ms":    0,
+            "llm_ms":          0,
+            "degrade_level":   "C0",
+            "degrade_reason":  "SYSTEM_ERROR",
         }
 
 
@@ -207,66 +237,73 @@ async def _run_internal(query: str, doc_version: int, t0: float, trace_id: str) 
     # 意图分类
     intent = await classify_intent(query)
 
-    # Query 缓存
-    q_cached = await cache.get_query(query, doc_version)
+    # Query 缓存（Layer-1）
+    q_cached  = await cache.get_query(query, doc_version)
     rewritten = q_cached.get("rewritten", query) if q_cached else await rewrite_query(query)
     if not q_cached:
         await cache.set_query(query, {"rewritten": rewritten}, doc_version)
 
-    # Embedding
-    t_ret_start = time.time()
+    # Embedding（带 Layer-2 缓存）
+    t_ret = time.time()
     try:
         query_vec = await get_embedding(rewritten)
     except Exception as e:
         logger.error(f"[{trace_id}] Embedding 失败: {e}")
         return {
-            "answer": "向量化服务暂时不可用。", "sources": [], "context": "",
-            "confidence": 0.0, "rewritten_query": rewritten, "intent": intent,
-            "cache_hit": False, "latency_ms": int((time.time() - t0) * 1000),
-            "degrade_level": "C0", "degrade_reason": "EMBED_FAIL",
+            "answer":          "向量化服务暂时不可用，请稍后重试。",
+            "sources":         [],
+            "context":         "",
+            "confidence":      0.0,
+            "rewritten_query": rewritten,
+            "intent":          intent,
+            "cache_hit":       False,
+            "latency_ms":      int((time.time() - t0) * 1000),
+            "retrieval_ms":    0,
+            "llm_ms":          0,
+            "degrade_level":   "C0",
+            "degrade_reason":  "EMBED_FAIL",
         }
 
-    # 检索
+    # 混合检索
     try:
         docs = await retriever.retrieve(rewritten, query_vec, top_k=settings.TOP_K)
     except Exception as e:
         logger.error(f"[{trace_id}] 检索失败: {e}")
         docs = []
-    retrieval_ms = int((time.time() - t_ret_start) * 1000)
+    retrieval_ms = int((time.time() - t_ret) * 1000)
 
     # Rerank
     top_docs = simple_reranker.rerank(rewritten, docs, top_n=settings.RERANK_TOP_N)
     context  = build_context(top_docs)
 
-    # Embedding 相似度均值（用于置信度）
+    # Embedding 相似度（取最高分 doc 的 score，用于置信度）
     emb_sim = float(top_docs[0].get("score", 0)) if top_docs else 0.0
 
-    # LLM 生成
-    t_llm_start = time.time()
+    # LLM 生成（硬超时降级）
+    t_llm = time.time()
     answer, degrade_level, degrade_reason = await generate_answer(rewritten, context, intent)
-    llm_ms = int((time.time() - t_llm_start) * 1000)
+    llm_ms = int((time.time() - t_llm) * 1000)
 
-    # LLM 自评分（异步，不阻塞）
+    # LLM 自评分（不阻塞）
     self_score = 0.5
     try:
         self_score = await asyncio.wait_for(llm_self_score(query, answer), timeout=2.5)
     except Exception:
         pass
 
-    # 置信度
+    # 置信度（修复归一化）
     confidence = calc_confidence(top_docs, emb_sim, self_score)
-
-    latency = int((time.time() - t0) * 1000)
+    latency    = int((time.time() - t0) * 1000)
 
     result = {
         "answer":          answer,
         "context":         context,
         "sources": [
             {
-                "text":         d.get("text", "")[:200],
-                "score":        round(d.get("rerank_score", 0), 4),
-                "doc_id":       d.get("doc_id", ""),
-                "chunk_idx":    d.get("chunk_idx", 0),
+                "text":      d.get("text", "")[:200],
+                "score":     round(d.get("rerank_score", 0), 4),
+                "doc_id":    d.get("doc_id", ""),
+                "chunk_idx": d.get("chunk_idx", 0),
             }
             for d in top_docs
         ],
@@ -291,7 +328,6 @@ async def _run_internal(query: str, doc_version: int, t0: float, trace_id: str) 
 
 async def run_rag_stream(query: str, trace_id: str = "") -> AsyncGenerator[str, None]:
     try:
-        intent   = await classify_intent(query)
         rewritten = await rewrite_query(query)
         query_vec = await get_embedding(rewritten)
         docs      = await retriever.retrieve(rewritten, query_vec)
@@ -310,4 +346,4 @@ async def run_rag_stream(query: str, trace_id: str = "") -> AsyncGenerator[str, 
             yield token
     except Exception as e:
         logger.error(f"[{trace_id}] 流式RAG失败: {e}")
-        yield f"抱歉，处理时发生错误。"
+        yield "抱歉，处理时发生错误，请稍后重试。"

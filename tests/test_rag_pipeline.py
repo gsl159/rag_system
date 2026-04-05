@@ -30,33 +30,34 @@ class TestDocParser:
         from app.services.doc_service import DocParser
         self.parser = DocParser()
 
-    def test_fallback_txt(self, tmp_path):
+    def test_parse_txt(self, tmp_path):
         f = tmp_path / "test.txt"
         f.write_text("Hello 你好 World")
-        result = self.parser._fallback_parse(str(f), ".txt")
+        result = self.parser.parse(str(f))
         assert "Hello" in result
         assert "你好" in result
 
-    def test_fallback_html_strips_tags(self, tmp_path):
+    def test_parse_html_strips_tags(self, tmp_path):
         f = tmp_path / "test.html"
         f.write_text("<html><body><p>Test Content</p><script>bad()</script></body></html>")
-        result = self.parser._fallback_parse(str(f), ".html")
+        result = self.parser.parse(str(f))
         assert "Test Content" in result
+        assert "bad()" not in result
 
-    def test_fallback_empty_file(self, tmp_path):
+    def test_parse_empty_file(self, tmp_path):
         f = tmp_path / "empty.txt"
         f.write_text("")
-        result = self.parser._fallback_parse(str(f), ".txt")
+        result = self.parser.parse(str(f))
         assert result == ""
 
-    def test_fallback_nonexistent_file(self):
-        result = self.parser._fallback_parse("/nonexistent/path.txt", ".txt")
+    def test_parse_nonexistent_file(self):
+        result = self.parser.parse("/nonexistent/path.txt")
         assert result == ""
 
     def test_parse_returns_string(self, tmp_path):
         f = tmp_path / "test.txt"
         f.write_text("普通文本内容")
-        result = self.parser._fallback_parse(str(f), ".txt")
+        result = self.parser.parse(str(f))
         assert isinstance(result, str)
 
 

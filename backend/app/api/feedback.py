@@ -32,7 +32,7 @@ async def submit(req: FeedbackRequest, db: AsyncSession = Depends(get_db),
     fb = await feedback_service.submit(
         query=req.query, answer=req.answer, feedback=req.feedback,
         comment=req.comment, log_id=req.log_id, session_id=req.session_id,
-        user_id=user.get("sub"), db=db,
+        db=db, user_id=user.get("sub"),
     )
     return ok({"id": fb.id, "message": "反馈已记录"})
 
