@@ -148,6 +148,10 @@ class TextSplitter:
     def split(self, text: str) -> List[str]:
         if not text or not text.strip():
             return []
+        # 文本比 chunk_size 短，直接返回一块
+        if len(text) <= self.chunk_size:
+            stripped = text.strip()
+            return [stripped] if stripped else []
         chunks = []
         start  = 0
         n      = len(text)
@@ -177,14 +181,14 @@ class TextSplitter:
 class QualityChecker:
     """基于有效 chunk 比例和平均长度评估文档质量"""
 
-    MIN_VALID_LEN = 20  # 最短有效 chunk 字符数
+    MIN_VALID_LEN = 10  # 最短有效 chunk 字符数（中文10字即有效内容）
 
     def evaluate(self, chunks: List[str]) -> Dict[str, Any]:
         if not chunks:
             return {"score": 0.0, "valid_ratio": 0.0, "avg_length": 0.0, "total": 0, "valid": 0}
         valid   = [c for c in chunks if len(c.strip()) >= self.MIN_VALID_LEN]
         avg_len = sum(len(c) for c in chunks) / len(chunks)
-        len_score = min(avg_len / 200.0, 1.0)   # 平均长度分（200字为满分）
+        len_score = min(avg_len / 100.0, 1.0)   # 平均长度分（100字为满分，适合中文短句）
         ratio_score = len(valid) / len(chunks)
         score = ratio_score * 0.7 + len_score * 0.3
         return {
