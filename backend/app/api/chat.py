@@ -8,13 +8,13 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.logger import logger
-from app.core.response import ok
-from app.core.security import get_current_user, check_rate_limit, generate_trace_id, verify_token
-from app.db.postgres import get_db, QueryLog, AuditLog
-from app.db.redis import cache
-from app.rag.pipeline import run_rag_pipeline, run_rag_stream
-from app.services.eval_service import eval_service
+from app.utils.logger import logger
+from app.api.deps import ok, err, ErrorCode, get_current_user, check_rate_limit, verify_token
+from app.utils.trace import generate_trace_id, set_trace_id
+from app.repository.postgres import get_db, QueryLog, AuditLog
+from app.repository.redis_cache import cache
+from app.service.rag_service import rag_service
+from app.service.eval_service import eval_service
 
 router = APIRouter(prefix="/chat", tags=["RAG 查询"])
 
@@ -41,13 +41,13 @@ async def chat(
         raise HTTPException(400, detail={"code": 1001, "message": "问题过长，请控制在2000字以内"})
 
     trace_id = generate_trace_id()
+    set_trace_id(trace_id)
     user_id  = user.get("sub", "anonymous")
 
     try:
-        doc_version = await cache.get_global_doc_version()
-        result = await run_rag_pipeline(
-            question, doc_version=doc_version,
-            session_id=req.session_id, user_id=user_id, trace_id=trace_id,
+        result = await rag_service.query(
+            question, user_id=user_id,
+            session_id=req.session_id,
         )
     except Exception as e:
         logger.error(f"[{trace_id}] RAG 执行失败: {e}")
@@ -108,7 +108,7 @@ async def chat(
 
 async def _async_evaluate(query: str, answer: str, context: str, log_id: int):
     try:
-        from app.db.postgres import AsyncSessionLocal
+        from app.repository.postgres import AsyncSessionLocal
         async with AsyncSessionLocal() as db:
             await eval_service.evaluate(
                 query=query, answer=answer, context=context, log_id=log_id, db=db,
@@ -132,7 +132,7 @@ async def chat_stream(
         raise HTTPException(400, detail={"code": 1001, "message": "问题不能为空"})
 
     # 从 query param 验证 token（开发环境跳过）
-    from app.core.config import settings
+    from app.config.settings import settings
     if settings.APP_ENV != "development":
         if not token:
             raise HTTPException(401, detail={"code": 1002, "message": "未提供认证令牌"})
@@ -141,10 +141,11 @@ async def chat_stream(
             raise HTTPException(401, detail={"code": 1002, "message": "令牌无效或已过期"})
 
     trace_id = generate_trace_id()
+    set_trace_id(trace_id)
 
     async def gen():
         try:
-            async for tok in run_rag_stream(q, trace_id=trace_id):
+            async for tok in rag_service.stream(q, user_id="stream_user"):
                 if not tok:
                     continue
                 # SSE: 多行内容用 data: 逐行发送
