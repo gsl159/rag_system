@@ -477,11 +477,11 @@ class TestRAGPipeline:
     @pytest.mark.asyncio
     async def test_run_rag_pipeline_basic(self):
         with patch.dict("sys.modules", {"redis": MagicMock(), "redis.asyncio": MagicMock()}):
-            from app.rag.pipeline import run_rag_pipeline
-            with patch("app.rag.pipeline.cache") as mc, \
-                 patch("app.rag.pipeline.embed_client") as me, \
-                 patch("app.rag.pipeline.retriever") as mr, \
-                 patch("app.rag.pipeline.llm_client") as ml:
+            from app.core.pipeline import run_rag_pipeline
+            with patch("app.core.pipeline.cache") as mc, \
+                 patch("app.core.pipeline.embed_client") as me, \
+                 patch("app.core.pipeline.retriever") as mr, \
+                 patch("app.core.pipeline.llm_client") as ml:
 
                 mc.get_rag = AsyncMock(return_value=None)
                 mc.set_rag = AsyncMock()
@@ -514,8 +514,8 @@ class TestRAGPipeline:
             "latency_ms": 10, "cache_hit": False, "degrade_level": "C2"
         }
         with patch.dict("sys.modules", {"redis": MagicMock(), "redis.asyncio": MagicMock()}):
-            from app.rag.pipeline import run_rag_pipeline
-            with patch("app.rag.pipeline.cache") as mc:
+            from app.core.pipeline import run_rag_pipeline
+            with patch("app.core.pipeline.cache") as mc:
                 mc.get_rag = AsyncMock(return_value=cached_result)
                 result = await run_rag_pipeline("什么是RAG？")
 
@@ -525,8 +525,8 @@ class TestRAGPipeline:
     @pytest.mark.asyncio
     async def test_rewrite_timeout_uses_original(self):
         with patch.dict("sys.modules", {"redis": MagicMock(), "redis.asyncio": MagicMock()}):
-            from app.rag.pipeline import rewrite_query
-            with patch("app.rag.pipeline.llm_client") as ml:
+            from app.core.pipeline import rewrite_query
+            with patch("app.core.pipeline.llm_client") as ml:
                 ml.chat = AsyncMock(side_effect=asyncio.TimeoutError())
                 result = await rewrite_query("原始问题")
         assert result == "原始问题"
@@ -534,7 +534,7 @@ class TestRAGPipeline:
     @pytest.mark.asyncio
     async def test_empty_context_no_crash(self):
         with patch.dict("sys.modules", {"redis": MagicMock(), "redis.asyncio": MagicMock()}):
-            from app.rag.pipeline import generate_answer
+            from app.core.pipeline import generate_answer
             answer, level, _ = await generate_answer("问题", "")
         assert level == "C0"
         assert answer
@@ -542,8 +542,8 @@ class TestRAGPipeline:
     @pytest.mark.asyncio
     async def test_generate_answer_c2_success(self):
         with patch.dict("sys.modules", {"redis": MagicMock(), "redis.asyncio": MagicMock()}):
-            from app.rag.pipeline import generate_answer
-            with patch("app.rag.pipeline.llm_client") as ml:
+            from app.core.pipeline import generate_answer
+            with patch("app.core.pipeline.llm_client") as ml:
                 ml.chat = AsyncMock(return_value="完整回答")
                 answer, level, _ = await generate_answer("问题", "上下文")
         assert answer == "完整回答"
@@ -573,7 +573,7 @@ class TestDocService:
         db.commit = AsyncMock()
         db.rollback = AsyncMock()
 
-        with patch("app.services.doc_service.settings") as ms:
+        with patch("app.service.doc_service.settings") as ms:
             ms.QUALITY_THRESHOLD = 0.6
             ms.CHUNK_SIZE = 500
             ms.CHUNK_OVERLAP = 50

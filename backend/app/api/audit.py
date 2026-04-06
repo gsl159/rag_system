@@ -5,9 +5,8 @@ from fastapi import APIRouter, Depends, Query
 from sqlalchemy import select, func, desc
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.response import ok
-from app.core.security import require_admin
-from app.db.postgres import get_db, AuditLog
+from app.api.deps import ok, err, ErrorCode, require_admin
+from app.repository.postgres import get_db, AuditLog
 
 router = APIRouter(prefix="/audit", tags=["审计日志"])
 

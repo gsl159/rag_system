@@ -6,12 +6,12 @@ from fastapi import APIRouter, UploadFile, File, Depends, HTTPException, Backgro
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.response import ok
-from app.core.security import get_current_user, generate_trace_id
-from app.db.postgres import get_db, Document, AuditLog
-from app.db.minio import minio_storage
-from app.db.redis import cache
-from app.services.doc_service import doc_service
+from app.api.deps import ok, err, ErrorCode, get_current_user
+from app.utils.trace import generate_trace_id
+from app.repository.postgres import get_db, Document, AuditLog
+from app.repository.object_store import minio_storage
+from app.repository.redis_cache import cache
+from app.service.doc_service import doc_service
 
 router = APIRouter(prefix="/upload", tags=["文档管理"])
 ALLOWED_EXTS = {".pdf", ".docx", ".doc", ".html", ".htm", ".txt", ".md"}
@@ -63,7 +63,7 @@ async def upload_document(
 
 
 async def _process_document(doc_id: str, ext: str, content: bytes):
-    from app.db.postgres import AsyncSessionLocal
+    from app.repository.postgres import AsyncSessionLocal
     tmp_path = None
     try:
         with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
@@ -72,7 +72,7 @@ async def _process_document(doc_id: str, ext: str, content: bytes):
             await doc_service.process(doc_id, tmp_path, sess)
         await cache.increment_doc_version()
     except Exception as e:
-        from app.core.logger import logger
+        from app.utils.logger import logger
         logger.error(f"后台处理失败 {doc_id}: {e}")
     finally:
         if tmp_path and os.path.exists(tmp_path):
@@ -127,7 +127,7 @@ async def delete_doc(
 
     try: minio_storage.delete(doc.file_path)
     except: pass
-    from app.db.milvus import milvus_db
+    from app.repository.vector_store import milvus_db
     try: milvus_db.delete_by_doc(doc_id)
     except: pass
 

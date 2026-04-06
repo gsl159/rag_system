@@ -1,55 +1,67 @@
-"""
-RAG System — FastAPI 主入口（生产级）
-"""
+"""RAG System — FastAPI entry point (enterprise architecture)."""
 from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from app.core.config import settings
-from app.core.logger import logger
-from app.core.response import ok
-from app.core.security import generate_trace_id
-from app.db.postgres import init_db
-from app.db.redis import cache
-from app.db.milvus import milvus_db
+from app.config.settings import settings
+from app.utils.logger import logger
+from app.utils.trace import generate_trace_id, set_trace_id
+from app.api.deps import ok, ErrorCode
+from app.repository.postgres import init_db, engine
+from app.repository.redis_cache import cache
+from app.repository.vector_store import milvus_db
 from app.api import chat, upload, feedback, metrics, auth, audit
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("=" * 60)
-    logger.info(f"RAG System 启动中... ENV={settings.APP_ENV}")
+    logger.info(f"RAG System starting... ENV={settings.APP_ENV}")
     try:
-        await init_db(); logger.info("✅ PostgreSQL 初始化完成")
+        await init_db()
+        logger.info("PostgreSQL initialized")
     except Exception as e:
-        logger.error(f"❌ PostgreSQL: {e}")
+        logger.error(f"PostgreSQL init failed: {e}")
     try:
-        await cache.connect(); logger.info("✅ Redis 连接成功")
+        await cache.connect()
+        logger.info("Redis connected")
     except Exception as e:
-        logger.error(f"❌ Redis: {e}")
+        logger.error(f"Redis connection failed: {e}")
     try:
-        milvus_db.connect(); logger.info("✅ Milvus 连接成功")
+        milvus_db.connect()
+        logger.info("Milvus connected")
     except Exception as e:
-        logger.error(f"❌ Milvus: {e}")
-    logger.info("🚀 系统启动完成")
+        logger.error(f"Milvus connection failed: {e}")
+    logger.info("System startup complete")
     yield
-    from app.db.postgres import engine
     await engine.dispose()
-    logger.info("RAG System 已关闭")
+    logger.info("RAG System shut down")
 
 
-app = FastAPI(title="RAG Knowledge System", version="1.0.0",
-              docs_url="/docs", redoc_url="/redoc", lifespan=lifespan)
+app = FastAPI(
+    title="RAG Knowledge System",
+    version="2.0.0",
+    docs_url="/docs",
+    redoc_url="/redoc",
+    lifespan=lifespan,
+)
 
-app.add_middleware(CORSMiddleware, allow_origins=["*"],
-                   allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 @app.middleware("http")
 async def trace_middleware(request: Request, call_next):
-    """为每个请求注入 trace_id"""
+    """Inject trace_id into every request and propagate via context."""
     trace_id = request.headers.get("X-Trace-Id") or generate_trace_id()
+    set_trace_id(trace_id)
     request.state.trace_id = trace_id
     response = await call_next(request)
     response.headers["X-Trace-Id"] = trace_id
@@ -59,11 +71,16 @@ async def trace_middleware(request: Request, call_next):
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
     trace_id = getattr(request.state, "trace_id", "")
-    logger.error(f"[{trace_id}] 未处理异常 [{request.method} {request.url}]: {exc}")
-    return JSONResponse(status_code=500, content={
-        "code": 5000, "message": "服务器内部错误，请稍后重试",
-        "data": None, "trace_id": trace_id,
-    })
+    logger.error(f"[{trace_id}] Unhandled exception [{request.method} {request.url}]: {exc}")
+    return JSONResponse(
+        status_code=500,
+        content={
+            "code": ErrorCode.SYSTEM_ERROR,
+            "message": "Internal server error, please try again later",
+            "data": None,
+            "trace_id": trace_id,
+        },
+    )
 
 
 app.include_router(auth.router)
@@ -74,15 +91,19 @@ app.include_router(metrics.router)
 app.include_router(audit.router)
 
 
-@app.get("/health", tags=["系统"])
+@app.get("/health", tags=["System"])
 async def health():
     return ok({
         "status": "ok" if milvus_db.is_connected else "degraded",
-        "version": "1.0.0", "env": settings.APP_ENV,
-        "checks": {"milvus": milvus_db.is_connected, "redis": cache.client is not None},
+        "version": "2.0.0",
+        "env": settings.APP_ENV,
+        "checks": {
+            "milvus": milvus_db.is_connected,
+            "redis": cache.client is not None,
+        },
     })
 
 
-@app.get("/", tags=["系统"])
+@app.get("/", tags=["System"])
 async def root():
     return ok({"message": "RAG Knowledge System is running", "docs": "/docs"})
