@@ -182,3 +182,24 @@ LLM_MODEL=llama3.1
 EMBED_MODEL=nomic-embed-text
 EMBED_DIM=768
 ```
+
+---
+
+## 🔐 生产部署安全清单
+
+> ⚠️ **以下配置在生产环境必须修改，切勿使用默认值**
+
+| 配置项 | 默认值（开发）| 生产要求 |
+|--------|--------------|---------|
+| `SILICONFLOW_API_KEY` | `sk-your-key-here` | 填入真实 API Key |
+| `JWT_SECRET` | `rag-system-secret-...` | 使用 64 位随机字符串 |
+| `POSTGRES_PASSWORD` | `ragpass123` | 强密码 |
+| `MINIO_SECRET_KEY` | `minioadmin123` | 强密码 |
+| `MINIO_ROOT_PASSWORD` | `minioadmin123` | 强密码 |
+
+**生成安全 JWT_SECRET：**
+```bash
+python3 -c "import secrets; print(secrets.token_hex(32))"
+```
+
+**⚠️ 注意：** `.env` 文件已加入 `.gitignore`，请勿手动将其提交到版本库。
