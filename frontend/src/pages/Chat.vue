@@ -212,7 +212,6 @@ async function sendStream(q) {
         messages.value[idx].done = true; es.close(); loading.value = false; return
       }
       messages.value[idx].content += e.data + '\n'
-')
       await scrollBottom()
     }
     es.onerror = () => { es.close(); messages.value[idx].done = true; loading.value = false }
