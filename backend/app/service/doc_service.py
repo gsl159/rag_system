@@ -256,7 +256,7 @@ class DocumentService:
             )
 
             # Step 7: 更新 BM25 内存索引
-            from app.rag.retriever import retriever
+            from app.core.retriever import retriever
             retriever.add_texts(chunks)
 
             # Step 8: PostgreSQL 持久化 Chunk 记录
