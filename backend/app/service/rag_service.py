@@ -7,7 +7,6 @@ Pipeline flow:
 """
 from typing import Any, AsyncGenerator, Dict, Optional
 
-from app.config.settings import settings          # noqa: F401
 from app.utils.logger import logger
 from app.utils.trace import get_trace_id
 from app.utils.context import RAGContext
