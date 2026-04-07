@@ -131,12 +131,12 @@ class TestDegradationFlow:
     @pytest.mark.asyncio
     async def test_milvus_down_uses_bm25(self):
         """Milvus不可用时，自动降级为纯BM25检索"""
-        from app.rag.retriever import HybridRetriever
+        from app.core.retriever import HybridRetriever
         r = HybridRetriever()
         r.add_texts(["这是BM25测试文档，包含关键词Python"])
 
         # 模拟Milvus失败
-        with patch("app.rag.retriever.milvus_db") as mock_milvus:
+        with patch("app.core.retriever.milvus_db") as mock_milvus:
             mock_milvus.search = MagicMock(side_effect=Exception("Milvus不可用"))
             result = await r.retrieve("Python", [0.1] * 1024, top_k=5)
 
@@ -146,10 +146,10 @@ class TestDegradationFlow:
     @pytest.mark.asyncio
     async def test_pipeline_no_docs_returns_graceful(self):
         """无相关文档时返回友好提示，不崩溃"""
-        from app.rag.pipeline import run_rag_pipeline
-        with patch("app.rag.pipeline.cache") as mc, \
-             patch("app.rag.pipeline.embed_client") as me, \
-             patch("app.rag.pipeline.retriever") as mr:
+        from app.core.pipeline import run_rag_pipeline
+        with patch("app.core.pipeline.cache") as mc, \
+             patch("app.core.pipeline.embed_client") as me, \
+             patch("app.core.pipeline.retriever") as mr:
 
             mc.get_rag = AsyncMock(return_value=None)
             mc.get_query = AsyncMock(return_value={"rewritten": "问题"})
@@ -166,7 +166,7 @@ class TestDegradationFlow:
             me.embed_one = AsyncMock(return_value=[0.1] * 1024)
             mr.retrieve = AsyncMock(return_value=[])  # 无检索结果
 
-            with patch("app.rag.pipeline.llm_client") as ml:
+            with patch("app.core.pipeline.llm_client") as ml:
                 ml.chat = AsyncMock(return_value="根据现有文档，未找到相关信息。")
                 result = await run_rag_pipeline("什么是量子力学？")
 
@@ -178,7 +178,7 @@ class TestDegradationFlow:
     @pytest.mark.asyncio
     async def test_c2_timeout_c1_succeeds(self):
         """C2超时后C1成功"""
-        from app.rag.pipeline import generate_answer
+        from app.core.pipeline import generate_answer
         import asyncio as aio
 
         call_count = 0
@@ -189,7 +189,7 @@ class TestDegradationFlow:
                 await aio.sleep(10)  # C2超时
             return "C1快速回答"
 
-        with patch("app.rag.pipeline.llm_client") as mock:
+        with patch("app.core.pipeline.llm_client") as mock:
             mock.chat = mock_chat
             answer, level, _ = await generate_answer("问题", "上下文")
 

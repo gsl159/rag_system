@@ -8,9 +8,9 @@ from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.response import ok
-from app.core.security import create_token, generate_trace_id, get_current_user
-from app.db.postgres import get_db, User, AuditLog
+from app.api.deps import ok, err, ErrorCode, create_token, get_current_user
+from app.utils.trace import generate_trace_id
+from app.repository.postgres import get_db, User, AuditLog
 
 router = APIRouter(prefix="/auth", tags=["认证"])
 

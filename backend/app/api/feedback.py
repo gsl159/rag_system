@@ -6,10 +6,9 @@ from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.response import ok
-from app.core.security import get_current_user
-from app.db.postgres import get_db
-from app.services.feedback_service import feedback_service
+from app.api.deps import ok, err, ErrorCode, get_current_user
+from app.repository.postgres import get_db
+from app.service.feedback_service import feedback_service
 
 router = APIRouter(prefix="/feedback", tags=["用户反馈"])
 

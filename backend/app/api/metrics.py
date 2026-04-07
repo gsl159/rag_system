@@ -5,12 +5,11 @@ from fastapi import APIRouter, Depends, Query
 from sqlalchemy import select, func, cast, Integer
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.response import ok
-from app.core.security import get_current_user
-from app.db.postgres import get_db, Document, QueryLog, Evaluation
-from app.db.redis import cache
-from app.db.milvus import milvus_db
-from app.services.eval_service import eval_service
+from app.api.deps import ok, err, ErrorCode, get_current_user
+from app.repository.postgres import get_db, Document, QueryLog, Evaluation
+from app.repository.redis_cache import cache
+from app.repository.vector_store import milvus_db
+from app.service.eval_service import eval_service
 
 router = APIRouter(prefix="/metrics", tags=["监控指标"])
 
