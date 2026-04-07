@@ -1911,7 +1911,29 @@ class Settings(BaseSettings):
 
 ---
 
-## Appendix A: Startup Sequence
+## Appendix A: Known Limitations and Recommendations
+
+### A.1 BM25 Corpus Persistence
+
+The in-memory BM25 corpus in `HybridRetriever` is **not persisted**. On service restart, the BM25 index is empty until new documents are uploaded. To mitigate:
+
+- **Current behavior**: Dense (Milvus) retrieval still works; BM25 gracefully returns empty results.
+- **Recommended improvement**: On startup, query all `chunks` from PostgreSQL and call `retriever.add_texts(all_chunk_texts)` to rebuild the BM25 index.
+
+### A.2 Sync Operations in Async Context
+
+Two components run synchronous I/O in the asyncio event loop thread:
+
+| Component | Issue | Recommended Fix |
+|---|---|---|
+| Milvus (`pymilvus`) | `search()` and `insert()` are blocking | Wrap with `asyncio.to_thread(milvus_db.search, query_vec, top_k)` |
+| BM25 (`rank_bm25`) | CPU-bound scoring under `threading.Lock` | Wrap with `await asyncio.get_event_loop().run_in_executor(None, self._sparse_search, query, top_k)` |
+
+These are acceptable at moderate concurrency but should be offloaded for high-throughput deployments.
+
+---
+
+## Appendix C: Startup Sequence
 
 ```python
 # app/main.py lifespan
@@ -1931,7 +1953,7 @@ async def lifespan(app):
     await engine.dispose()
 ```
 
-## Appendix B: Infrastructure Services
+## Appendix D: Infrastructure Services
 
 | Service | Image | Ports | Purpose |
 |---|---|---|---|
