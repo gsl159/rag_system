@@ -7,8 +7,14 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+from slowapi import _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+
 from app.core.config import settings
 from app.core.logger import logger
+from app.core.limiter import limiter
+from app.core.tracing import init_tracing
+from app.core.security import auth_middleware
 from app.db.postgres import init_db
 from app.db.redis import cache
 from app.db.milvus import milvus_db
@@ -20,6 +26,9 @@ async def lifespan(app: FastAPI):
     # ── 启动 ─────────────────────────────────────
     logger.info("=" * 50)
     logger.info("RAG System 启动中...")
+
+    # 链路追踪（须尽早初始化）
+    init_tracing()
 
     try:
         await init_db()
@@ -34,7 +43,8 @@ async def lifespan(app: FastAPI):
         logger.error(f"❌ Redis 连接失败: {e}")
 
     try:
-        milvus_db.connect()
+        # Milvus 2.5 原生 Sparse/BM25，无需再重建进程内 BM25 索引
+        await milvus_db.connect()
         logger.info("✅ Milvus 连接成功")
     except Exception as e:
         logger.error(f"❌ Milvus 连接失败: {e}")
@@ -52,16 +62,23 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="RAG Knowledge System",
     description="企业级 RAG 知识库系统 API",
-    version="1.0.0",
+    version="2.0.0",
     docs_url="/docs",
     redoc_url="/redoc",
     lifespan=lifespan,
 )
 
-# CORS（生产环境收窄 origins）
+# 限流
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+# 认证中间件（OIDC/JWT → 租户上下文）
+app.middleware("http")(auth_middleware)
+
+# CORS（生产环境通过 CORS_ORIGINS 收窄白名单）
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=settings.cors_origins_list,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -86,7 +103,7 @@ app.include_router(metrics.router)
 
 @app.get("/health", tags=["系统"])
 async def health():
-    return {"status": "ok", "version": "1.0.0", "env": settings.APP_ENV}
+    return {"status": "ok", "version": "2.0.0", "env": settings.APP_ENV}
 
 
 @app.get("/", tags=["系统"])

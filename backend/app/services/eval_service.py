@@ -6,7 +6,7 @@
 from datetime import datetime, timedelta
 from typing import Dict, Any, List
 
-from sqlalchemy import select, func, and_
+from sqlalchemy import select, func, and_, Integer
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.llm import llm_client
@@ -25,12 +25,14 @@ class EvalService:
         context: str = "",
         log_id:  int = None,
         db:      AsyncSession = None,
+        tenant_id: str = "default",
     ) -> Dict[str, Any]:
         scores = await self._llm_score(query, answer, context)
 
         if db:
             ev = Evaluation(
                 log_id       = log_id,
+                tenant_id    = tenant_id,
                 query        = query,
                 answer       = answer,
                 relevance    = scores.get("relevance",    0),
@@ -100,7 +102,7 @@ class EvalService:
                 func.date(QueryLog.created_at).label("day"),
                 func.count().label("queries"),
                 func.avg(QueryLog.latency_ms).label("avg_latency"),
-                func.sum(QueryLog.cache_hit.cast(func.Integer() if False else "INTEGER")).label("cache_hits"),
+                func.sum(QueryLog.cache_hit.cast(Integer)).label("cache_hits"),
             )
             .where(QueryLog.created_at >= since)
             .group_by("day")

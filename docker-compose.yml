@@ -43,7 +43,6 @@ services:
     volumes:
       - minio_data:/data
     healthcheck:
-      # 用 mc 命令直接探活，比 HTTP 端点可靠得多
       test: ["CMD", "mc", "ready", "local"]
       interval: 10s
       timeout: 10s
@@ -67,7 +66,8 @@ services:
     restart: "no"
 
   milvus:
-    image: milvusdb/milvus:v2.3.9
+    # 2.5+ 内置 Sparse/BM25 原生全文检索（替代进程内 BM25）
+    image: milvusdb/milvus:v2.5.4
     logging: *default-logging
     command: ["milvus", "run", "standalone"]
     environment:
@@ -133,6 +133,19 @@ services:
       retries: 5
     restart: unless-stopped
 
+  # ───────────── 可观测性 ─────────────
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.57
+    logging: *default-logging
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686"   # Jaeger UI
+      - "4317:4317"     # OTLP gRPC
+      - "4318:4318"     # OTLP HTTP
+    restart: unless-stopped
+
   # ───────────── 应用层 ─────────────
 
   backend:
@@ -148,6 +161,36 @@ services:
       REDIS_URL:      redis://redis:6379/0
       MILVUS_HOST:    milvus
       MINIO_ENDPOINT: minio:9000
+      CELERY_BROKER_URL:   redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      milvus:
+        condition: service_healthy
+    volumes:
+      - backend_logs:/app/logs
+    restart: unless-stopped
+
+  # Celery worker：剥离文档解析/向量化等耗时任务，支持重试
+  worker:
+    build:
+      context:    ./backend
+      dockerfile: Dockerfile
+    logging: *default-logging
+    command: ["celery", "-A", "app.tasks.celery_app.celery_app", "worker", "-l", "info", "--concurrency", "2"]
+    env_file: .env
+    environment:
+      DATABASE_URL:   postgresql+asyncpg://raguser:ragpass123@postgres:5432/ragdb
+      REDIS_URL:      redis://redis:6379/0
+      MILVUS_HOST:    milvus
+      MINIO_ENDPOINT: minio:9000
+      CELERY_BROKER_URL:   redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
     depends_on:
       postgres:
         condition: service_healthy

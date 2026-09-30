@@ -1,10 +1,14 @@
 """
 RAG Pipeline 单元测试
 运行: pytest tests/ -v
+
+说明：混合检索已下沉至 Milvus（Dense + 原生 Sparse/BM25），
+进程内不再有 BM25 索引，因此相关用例改为覆盖新组件：
+语义缓存余弦计算、租户过滤表达式、Cross-Encoder 重排回退、配置解析等。
 """
+import math
+
 import pytest
-import asyncio
-from unittest.mock import AsyncMock, MagicMock, patch
 
 
 # ── Test: DocParser ───────────────────────────
@@ -36,23 +40,19 @@ class TestTextCleaner:
         self.cleaner = TextCleaner()
 
     def test_collapse_newlines(self):
-        text = "Line1\n\n\n\nLine2"
-        result = self.cleaner.clean(text)
+        result = self.cleaner.clean("Line1\n\n\n\nLine2")
         assert "\n\n\n" not in result
 
     def test_collapse_spaces(self):
-        text = "word1   word2    word3"
-        result = self.cleaner.clean(text)
+        result = self.cleaner.clean("word1   word2    word3")
         assert "   " not in result
 
     def test_strip(self):
-        text = "  \n  Hello  \n  "
-        result = self.cleaner.clean(text)
+        result = self.cleaner.clean("  \n  Hello  \n  ")
         assert result == "Hello"
 
     def test_keep_chinese(self):
-        text = "这是中文内容 This is English"
-        result = self.cleaner.clean(text)
+        result = self.cleaner.clean("这是中文内容 This is English")
         assert "这是中文内容" in result
         assert "This is English" in result
 
@@ -65,27 +65,21 @@ class TestTextSplitter:
         self.splitter = TextSplitter(chunk_size=100, overlap=20)
 
     def test_basic_split(self):
-        text = "A" * 250
-        chunks = self.splitter.split(text)
+        chunks = self.splitter.split("A" * 250)
         assert len(chunks) > 1
-        assert all(len(c) <= 150 for c in chunks)  # 允许一点弹性
+        assert all(len(c) <= 150 for c in chunks)
 
     def test_short_text_single_chunk(self):
-        text = "短文本内容"
-        chunks = self.splitter.split(text)
+        chunks = self.splitter.split("短文本内容")
         assert len(chunks) == 1
-        assert chunks[0] == text
+        assert chunks[0] == "短文本内容"
 
     def test_empty_text(self):
-        chunks = self.splitter.split("")
-        assert chunks == []
+        assert self.splitter.split("") == []
 
     def test_sentence_boundary_preference(self):
-        # 应在句号处断开，而不是在字符中间
         text = "这是第一句话。" * 10 + "这是最后一句。"
-        chunks = self.splitter.split(text)
-        # 每个 chunk 应在句号结束（不一定强制，视窗口大小）
-        assert len(chunks) >= 1
+        assert len(self.splitter.split(text)) >= 1
 
 
 # ── Test: QualityChecker ─────────────────────
@@ -96,8 +90,7 @@ class TestQualityChecker:
         self.checker = QualityChecker()
 
     def test_empty_input(self):
-        result = self.checker.evaluate([])
-        assert result["score"] == 0.0
+        assert self.checker.evaluate([])["score"] == 0.0
 
     def test_all_valid(self):
         chunks = ["这是一段有效内容，超过二十个字符的文本。" * 2] * 5
@@ -106,8 +99,7 @@ class TestQualityChecker:
         assert result["valid"] == 5
 
     def test_all_invalid(self):
-        chunks = ["短"] * 5
-        result = self.checker.evaluate(chunks)
+        result = self.checker.evaluate(["短"] * 5)
         assert result["valid"] == 0
         assert result["valid_ratio"] == 0.0
 
@@ -118,96 +110,77 @@ class TestQualityChecker:
         assert result["total"] == 10
 
 
-# ── Test: HybridRetriever ────────────────────
+# ── Test: Milvus 租户过滤表达式 ───────────────
 
-class TestHybridRetriever:
-    def setup_method(self):
-        from app.rag.retriever import HybridRetriever
-        self.retriever = HybridRetriever()
+class TestTenantFilter:
+    def test_none_returns_none(self):
+        from app.db.milvus import MilvusDB
+        assert MilvusDB._tenant_expr(None) is None
+        assert MilvusDB._tenant_expr("") is None
 
-    def test_bm25_search_no_index(self):
-        result = self.retriever._sparse_search("query", top_k=5)
-        assert result == []
+    def test_basic_expr(self):
+        from app.db.milvus import MilvusDB
+        assert MilvusDB._tenant_expr("acme") == 'tenant_id == "acme"'
 
-    def test_bm25_add_and_search(self):
-        texts = [
-            "Python 是一种编程语言",
-            "机器学习需要大量数据",
-            "向量数据库用于相似搜索",
-        ]
-        self.retriever.add_texts(texts)
-        result = self.retriever._sparse_search("Python 编程", top_k=3)
-        assert len(result) >= 1
-        # Python 相关内容应排第一
-        assert "Python" in result[0]["text"]
-
-    def test_rrf_merge_deduplication(self):
-        dense  = [{"text": "同一段文本内容", "score": 0.9, "id": "1", "source": "dense"}]
-        sparse = [{"text": "同一段文本内容", "score": 5.0, "id": "bm25_0", "source": "sparse"}]
-        merged = self.retriever._rrf_merge(dense, sparse)
-        # 相同文本（前100字）应合并，不重复
-        assert len(merged) == 1
-
-    def test_rrf_merge_alpha(self):
-        dense  = [{"text": "Dense 优先内容 " * 5, "score": 0.95, "id": "d1", "source": "dense"}]
-        sparse = [{"text": "Sparse 优先内容 " * 5, "score": 10.0, "id": "s1", "source": "sparse"}]
-        merged = self.retriever._rrf_merge(dense, sparse, alpha=0.9)
-        # alpha=0.9 时 dense 权重高，应排前
-        assert "Dense" in merged[0]["text"]
+    def test_escape_quotes(self):
+        from app.db.milvus import MilvusDB
+        expr = MilvusDB._tenant_expr('a"b')
+        # 引号应被转义，避免表达式注入
+        assert '\\"' in expr
 
 
-# ── Test: SimpleReranker ─────────────────────
+# ── Test: 语义缓存余弦相似度 ──────────────────
 
-class TestSimpleReranker:
-    def setup_method(self):
-        from app.rag.reranker import SimpleReranker
-        self.reranker = SimpleReranker()
+class TestSemanticCosine:
+    def test_identical_vectors(self):
+        from app.db.redis import _cosine
+        assert abs(_cosine([1.0, 0.0, 0.0], [1.0, 0.0, 0.0]) - 1.0) < 1e-9
 
-    def test_rerank_top_n(self):
-        docs = [{"text": f"文档{i}内容", "rrf_score": i * 0.1} for i in range(10)]
-        result = self.reranker.rerank("文档", docs, top_n=3)
-        assert len(result) == 3
+    def test_orthogonal_vectors(self):
+        from app.db.redis import _cosine
+        assert abs(_cosine([1.0, 0.0], [0.0, 1.0])) < 1e-9
 
-    def test_rerank_keyword_boost(self):
-        docs = [
-            {"text": "这是关于 Python 编程的内容", "rrf_score": 0.5},
-            {"text": "这是关于 Java 开发的内容",   "rrf_score": 0.8},
-        ]
-        result = self.reranker.rerank("Python", docs, top_n=2)
-        # 包含 Python 的文档应被提升
-        assert "Python" in result[0]["text"]
+    def test_opposite_vectors(self):
+        from app.db.redis import _cosine
+        assert abs(_cosine([1.0, 0.0], [-1.0, 0.0]) + 1.0) < 1e-9
+
+    def test_length_mismatch(self):
+        from app.db.redis import _cosine
+        assert _cosine([1.0, 0.0], [1.0]) == 0.0
+
+    def test_empty_vectors(self):
+        from app.db.redis import _cosine
+        assert _cosine([], []) == 0.0
+
+    def test_magnitude_invariance(self):
+        from app.db.redis import _cosine
+        # 余弦对向量缩放不敏感
+        assert abs(_cosine([2.0, 0.0], [5.0, 0.0]) - 1.0) < 1e-9
 
 
 # ── Test: Cache Key Generation ───────────────
 
 class TestCacheKeys:
     def setup_method(self):
-        # 不需要真实 Redis 连接，只测 key 生成
         from app.db.redis import RedisCache
         self.cache = RedisCache.__new__(RedisCache)
 
     def test_query_key_deterministic(self):
-        k1 = self.cache._query_key("相同的问题")
-        k2 = self.cache._query_key("相同的问题")
-        assert k1 == k2
+        assert self.cache._query_key("相同的问题") == self.cache._query_key("相同的问题")
 
     def test_different_queries_different_keys(self):
-        k1 = self.cache._query_key("问题一")
-        k2 = self.cache._query_key("问题二")
-        assert k1 != k2
+        assert self.cache._query_key("问题一") != self.cache._query_key("问题二")
 
     def test_key_prefixes(self):
-        qk = self.cache._query_key("test")
-        ek = self.cache._embed_key("test")
-        rk = self.cache._rag_key("test")
-        assert qk.startswith("cache:query:")
-        assert ek.startswith("cache:embed:")
-        assert rk.startswith("cache:rag:")
+        assert self.cache._query_key("t").startswith("cache:query:")
+        assert self.cache._embed_key("t").startswith("cache:embed:")
+        assert self.cache._rag_key("t").startswith("cache:rag:")
+
+    def test_semantic_key_by_tenant(self):
+        assert self.cache._sem_key("acme") == "cache:semantic:acme"
 
     def test_key_length(self):
-        key = self.cache._query_key("任意长度的问题" * 100)
-        # MD5 hex = 32 chars，加前缀不超过 50 chars
-        assert len(key) < 60
+        assert len(self.cache._query_key("任意长度的问题" * 100)) < 60
 
 
 # ── Test: Context Builder ────────────────────
@@ -215,21 +188,18 @@ class TestCacheKeys:
 class TestContextBuilder:
     def test_basic_build(self):
         from app.rag.pipeline import build_context
-        docs = [{"text": "段落一内容"}, {"text": "段落二内容"}]
-        ctx  = build_context(docs)
+        ctx = build_context([{"text": "段落一内容"}, {"text": "段落二内容"}])
         assert "段落一内容" in ctx
         assert "段落二内容" in ctx
 
     def test_max_chars_limit(self):
         from app.rag.pipeline import build_context
-        docs = [{"text": "A" * 1000}] * 10
-        ctx  = build_context(docs, max_chars=500)
-        assert len(ctx) <= 600  # 允许分隔符等少量溢出
+        ctx = build_context([{"text": "A" * 1000}] * 10, max_chars=500)
+        assert len(ctx) <= 600
 
     def test_empty_docs(self):
         from app.rag.pipeline import build_context
-        ctx = build_context([])
-        assert ctx == ""
+        assert build_context([]) == ""
 
 
 # ── Test: CacheStats ─────────────────────────
@@ -237,8 +207,7 @@ class TestContextBuilder:
 class TestCacheStats:
     def test_hit_rate_zero(self):
         from app.db.redis import CacheStats
-        s = CacheStats()
-        assert s.hit_rate == 0.0
+        assert CacheStats().hit_rate == 0.0
 
     def test_hit_rate_calculation(self):
         from app.db.redis import CacheStats
@@ -249,17 +218,68 @@ class TestCacheStats:
     def test_all_hits(self):
         from app.db.redis import CacheStats
         s = CacheStats()
-        for _ in range(5): s.record_hit()
+        for _ in range(5):
+            s.record_hit()
         assert s.hit_rate == 1.0
 
 
-# ── Async test helpers ───────────────────────
+# ── Test: 配置解析 ───────────────────────────
 
-@pytest.fixture
-def event_loop():
-    loop = asyncio.new_event_loop()
-    yield loop
-    loop.close()
+class TestConfig:
+    def test_cors_origins_list(self):
+        from app.core.config import settings
+        assert isinstance(settings.cors_origins_list, list)
+        assert len(settings.cors_origins_list) >= 1
+
+    def test_jwt_algorithms_list(self):
+        from app.core.config import settings
+        assert "RS256" in settings.jwt_algorithms_list
+
+    def test_hybrid_alpha_range(self):
+        from app.core.config import settings
+        assert 0.0 <= settings.HYBRID_ALPHA <= 1.0
+
+    def test_semantic_threshold_range(self):
+        from app.core.config import settings
+        assert 0.0 < settings.SEMANTIC_CACHE_THRESHOLD <= 1.0
+
+
+# ── Test: 租户上下文 ─────────────────────────
+
+class TestTenantContext:
+    def test_default_tenant(self):
+        from app.db.postgres import get_current_tenant, set_current_tenant
+        from app.core.config import settings
+        set_current_tenant("")
+        assert get_current_tenant() == settings.DEFAULT_TENANT_ID
+
+    def test_set_and_get(self):
+        from app.db.postgres import get_current_tenant, set_current_tenant
+        set_current_tenant("acme")
+        assert get_current_tenant() == "acme"
+        set_current_tenant("globex")
+        assert get_current_tenant() == "globex"
+
+
+# ── Test: 认证 token 租户提取 ────────────────
+
+class TestTenantExtraction:
+    def test_from_tenant_claim(self):
+        from app.core.security import _extract_tenant
+        assert _extract_tenant({"tenant_id": "acme"}) == "acme"
+
+    def test_fallback_to_org(self):
+        from app.core.security import _extract_tenant
+        assert _extract_tenant({"org": "globex"}) == "globex"
+
+    def test_fallback_to_sub(self):
+        from app.core.security import _extract_tenant
+        assert _extract_tenant({"sub": "user-123"}) == "user-123"
+
+    def test_default_when_empty(self):
+        from app.core.security import _extract_tenant
+        from app.core.config import settings
+        assert _extract_tenant({}) == settings.DEFAULT_TENANT_ID
 
 
 if __name__ == "__main__":

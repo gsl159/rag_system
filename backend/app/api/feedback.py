@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.postgres import get_db
+from app.db.postgres import get_db, get_current_tenant
 from app.services.feedback_service import feedback_service
 
 router = APIRouter(prefix="/feedback", tags=["用户反馈"])
@@ -30,6 +30,7 @@ async def submit(req: FeedbackRequest, db: AsyncSession = Depends(get_db)):
         query=req.query, answer=req.answer, feedback=req.feedback,
         comment=req.comment, log_id=req.log_id,
         session_id=req.session_id, db=db,
+        tenant_id=get_current_tenant(),
     )
     return {"message": "反馈已记录", "id": fb.id}
 

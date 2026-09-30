@@ -21,7 +21,7 @@ async def overview(db: AsyncSession = Depends(get_db)):
     avg_score   = (await db.execute(select(func.avg(Evaluation.overall)))).scalar() or 0
     avg_lat     = (await db.execute(select(func.avg(QueryLog.latency_ms)))).scalar() or 0
     cache_stats = await cache.get_stats()
-    milvus_stats= milvus_db.get_stats()
+    milvus_stats= await milvus_db.get_stats()
 
     return {
         "doc_count":       doc_total,

@@ -23,9 +23,11 @@ class FeedbackService:
         log_id:     Optional[int],
         session_id: Optional[str],
         db:         AsyncSession,
+        tenant_id:  str = "default",
     ) -> Feedback:
         fb = Feedback(
             log_id     = log_id,
+            tenant_id  = tenant_id,
             session_id = session_id,
             query      = query,
             answer     = answer,

@@ -15,10 +15,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import settings
 from app.core.logger import logger
 from app.core.llm import embed_client
-from app.db.postgres import Document, Chunk
+from app.db.postgres import Document, Chunk, get_current_tenant
 from app.db.milvus import milvus_db
-from app.db.minio import minio_storage
-from app.rag.retriever import retriever
 
 
 class DocParser:
@@ -90,7 +88,14 @@ class TextSplitter:
             chunk = text[start:end].strip()
             if chunk:
                 chunks.append(chunk)
-            start = end - self.overlap
+            # 已达文末，结束
+            if end >= len(text):
+                break
+            # 保证游标前进，避免 overlap >= 剩余长度时死循环
+            new_start = end - self.overlap
+            if new_start <= start:
+                new_start = end
+            start = new_start
         return chunks
 
 
@@ -123,8 +128,9 @@ class DocumentService:
         self.splitter= TextSplitter()
         self.checker = QualityChecker()
 
-    async def process(self, doc_id: str, file_path: str, db: AsyncSession):
-        logger.info(f"开始处理文档 doc_id={doc_id}")
+    async def process(self, doc_id: str, file_path: str, db: AsyncSession, tenant_id: str = None):
+        tenant_id = tenant_id or get_current_tenant()
+        logger.info(f"开始处理文档 doc_id={doc_id} tenant={tenant_id}")
         await self._set_status(db, doc_id, "processing")
 
         try:
@@ -151,24 +157,23 @@ class DocumentService:
             # 5. Embedding
             embeddings = await embed_client.embed_batch(chunks)
 
-            # 6. Milvus 入库
+            # 6. Milvus 入库（携带 tenant_id，Dense+Sparse 由 Milvus 内部生成）
             chunk_ids  = [str(uuid.uuid4()) for _ in chunks]
-            milvus_db.insert(
+            await milvus_db.insert(
                 ids        = chunk_ids,
                 doc_ids    = [doc_id] * len(chunks),
+                tenant_ids = [tenant_id] * len(chunks),
                 chunk_idxs = list(range(len(chunks))),
                 texts      = chunks,
                 embeddings = embeddings,
             )
 
-            # 7. BM25 索引更新
-            retriever.add_texts(chunks)
-
-            # 8. PostgreSQL 入库
+            # 7. PostgreSQL 入库
             chunk_rows = [
                 Chunk(
                     id        = chunk_ids[i],
                     doc_id    = doc_id,
+                    tenant_id = tenant_id,
                     content   = chunks[i],
                     chunk_idx = i,
                     char_count= len(chunks[i]),
